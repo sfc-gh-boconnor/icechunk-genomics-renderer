@@ -102,19 +102,21 @@ Snowflake:
 ## Workflow
 
 ```
-Step 0: Snowflake setup (DB, pool, EAIs — reuse S3 bucket/secrets)
+Step 0: Snowflake setup (DB, pool, EAIs, role/user — reuse S3 bucket/secrets)
     ↓
 Step 1: Build & push Docker images
     ↓
-Step 2: Deploy SPCS services
+Step 2: Deploy SPCS services + apply grants
     ↓
-Step 3: Seed chr22 into IceChunk (~2–10 min)
+Step 3: Seed 1000G variants (chr22) into IceChunk  ~2–10 min
     ↓
-Step 4: Create external functions + Cortex Agent
+Step 4: Seed ClinVar (chr22) into IceChunk         ~4–8 min
     ↓
-Step 5: Verify
+Step 5: Create external functions + Cortex Agent
     ↓
-Step 6: (Optional) Seed more chromosomes
+Step 6: Verify
+    ↓
+Step 7: (Optional) Seed more chromosomes / load SAMPLE_METRICS
 ```
 
 ---
@@ -147,28 +149,33 @@ bash deploy.sh
 # Prints the live app URL when complete
 ```
 
-**EAIs required:**
-- `gragen-service`: `ICECHUNK_S3_EAI` (write to private bucket) + `GENOMICS_1000G_EAI` (read public VCFs during ingest)
-- `gragen-accelerator`: `GRAGEN_MAP_TILES_EAI`
+**EAIs required on `gragen-service`:** `ICECHUNK_S3_EAI` + `GENOMICS_1000G_EAI` + `NCBI_FTP_EAI`  
+**EAI required on `gragen-accelerator`:** `GRAGEN_MAP_TILES_EAI`
 
 **After any `ALTER SERVICE`**, re-apply EAIs:
 ```sql
 ALTER SERVICE GRAGEN_DB.GRAGEN.GRAGEN_SERVICE
-  SET EXTERNAL_ACCESS_INTEGRATIONS = (ICECHUNK_S3_EAI, GENOMICS_1000G_EAI);
+  SET EXTERNAL_ACCESS_INTEGRATIONS = (ICECHUNK_S3_EAI, GENOMICS_1000G_EAI, NCBI_FTP_EAI);
 
 ALTER SERVICE GRAGEN_DB.GRAGEN.GRAGEN_ACCELERATOR_SERVICE
   SET EXTERNAL_ACCESS_INTEGRATIONS = (GRAGEN_MAP_TILES_EAI);
+```
+
+**Re-apply endpoint grants** (needed after any service update):
+```sql
+GRANT SERVICE ROLE GRAGEN_DB.GRAGEN.GRAGEN_ACCELERATOR_SERVICE!ALL_ENDPOINTS_USAGE TO ROLE PUBLIC;
+GRANT SERVICE ROLE GRAGEN_DB.GRAGEN.GRAGEN_ACCELERATOR_SERVICE!ALL_ENDPOINTS_USAGE TO ROLE ICECHUNK_DB;
+GRANT SERVICE ROLE GRAGEN_DB.GRAGEN.GRAGEN_ACCELERATOR_SERVICE!ALL_ENDPOINTS_USAGE TO ROLE SYSADMIN;
+```
 ```
 
 ---
 
 ### Step 3: Seed chr22 into IceChunk
 
-Trigger the VCF → IceChunk ingest via the DataLoader in the UI, or directly:
+Trigger via the app UI or directly after services are running:
 
 ```bash
-# Via the app (DataLoader panel → select chr22 → Seed)
-# Or via curl (from local machine with EAI-accessible network):
 curl -X POST https://<URL>/api/direct/seed_genomics \
   -H "Content-Type: application/json" \
   -d '{"chroms": ["chr22"], "max_workers": 16}'
@@ -178,14 +185,41 @@ curl -X POST https://<URL>/api/direct/seed_genomics \
 1. Backend lists all 3,202 sample IDs from S3
 2. For each sample: pysam reads chr22 variants via HTTPS range request (TBI index)
 3. Aggregates allele frequencies across all samples
-4. Writes 1D arrays to IceChunk Zarr (position, allele_freq, het_rate, variant_type)
-5. Commits IceChunk snapshot with tag `chr22_v1_3202samples_<timestamp>`
+4. Writes 1D arrays to IceChunk Zarr: `position`, `allele_freq`, `het_rate`, `variant_type`
+5. Commits snapshot with tag `chr22_v1_3202samples_<timestamp>`
 
 **Time:** ~2–10 minutes (16 parallel VCF readers, chr22 only)
 
 ---
 
-### Step 4: External Functions + Cortex Agent
+### Step 4: Seed ClinVar (chr22) into IceChunk
+
+Run immediately after Step 3 to populate clinical annotations:
+
+```bash
+curl -X POST https://<URL>/api/direct/seed_clinvar \
+  -H "Content-Type: application/json" \
+  -d '{"chroms": ["chr22"]}'
+```
+
+**What happens:**
+1. pysam reads ClinVar VCF.gz directly from NCBI FTP via HTTPS range request
+2. Encodes clinical significance: 0=Benign → 4=Pathogenic (+ review confidence)
+3. Writes 1D arrays per chromosome: `position`, `clinsig`, `revstat`, `allele_id`
+4. Commits snapshot to `s3://icechunk-ro/clinvar_repo/`
+
+**Time:** ~4–8 minutes (chr22: ~200K ClinVar variants)
+
+**Verify ClinVar store:**
+```bash
+curl https://<URL>/api/meta/clinvar
+# Should show: chromosomes_in_store: { chr22: { n_variants: ~200000,
+#              n_pathogenic: ~5000, n_likely_path: ~8000, n_vus: ~120000 } }
+```
+
+---
+
+### Step 5: External Functions + Cortex Agent
 
 ```bash
 snow sql -f sql/02_external_functions.sql -c <CONNECTION>
@@ -193,37 +227,76 @@ snow sql -f sql/02_external_functions.sql -c <CONNECTION>
 
 ---
 
-### Step 5: Verify
+### Step 6: Verify
 
 ```bash
 # Check services are running
 snow spcs service status GRAGEN_SERVICE -c <CONNECTION>
 
-# Check IceChunk store has chr22 data
+# Check 1000G IceChunk store has chr22 data
 curl https://<URL>/api/meta
 # Should show: chromosomes_in_store: { chr22: { n_variants: ~120000, ... } }
 
-# Test slice
+# Check ClinVar store has chr22 data
+curl https://<URL>/api/meta/clinvar
+# Should show: chromosomes_in_store: { chr22: { n_pathogenic: ~5000, ... } }
+
+# Test 1000G variant slice
 curl https://<URL>/api/direct/variants \
+  -H "Content-Type: application/json" \
+  -d '{"chrom": "chr22", "start": 20000000, "end": 21000000}'
+
+# Test ClinVar slice
+curl https://<URL>/api/direct/clinvar \
   -H "Content-Type: application/json" \
   -d '{"chrom": "chr22", "start": 20000000, "end": 21000000}'
 ```
 
 ---
 
+### Step 7: (Optional) Seed more chromosomes
+
+```bash
+# Seed all autosomes + X for 1000G:
+curl -X POST https://<URL>/api/direct/seed_genomics \
+  -d '{"chroms": ["chr1","chr2","chr3","chr4","chr5","chr6","chr7",
+       "chr8","chr9","chr10","chr11","chr12","chr13","chr14","chr15",
+       "chr16","chr17","chr18","chr19","chr20","chr21","chrX"]}'
+
+# Seed all chromosomes for ClinVar (~30 min for full genome):
+curl -X POST https://<URL>/api/direct/seed_clinvar \
+  -d '{"chroms": ["chr1","chr2","chr3","chr4","chr5","chr6","chr7",
+       "chr8","chr9","chr10","chr11","chr12","chr13","chr14","chr15",
+       "chr16","chr17","chr18","chr19","chr20","chr21","chr22","chrX"]}'
+```
+
+---
+
 ## Critical Rules
 
-1. **IceChunk store must be seeded before queries work.** `/meta` shows which chromosomes are available. If empty, run `/seed_genomics`.
+1. **Both IceChunk stores must be seeded before queries work:**
+   - `genomics_repo/` (1000G variants) → seed via `POST /api/direct/seed_genomics`
+   - `clinvar_repo/` (ClinVar annotations) → seed via `POST /api/direct/seed_clinvar`
+   - `/meta` and `/meta/clinvar` show which chromosomes are available.
 
-2. **Reuses weather project's S3 bucket** — prefix is `genomics_repo/`. The `AWS_ACCESS_KEY_ID` secret must have write access to `icechunk-ro`.
+2. **Reuses weather project's S3 bucket** — prefixes are `genomics_repo/` and `clinvar_repo/`. The `AWS_ACCESS_KEY_ID` secret must have write access to `icechunk-ro`.
 
-3. **VCF ingestion uses pysam HTTPS range requests** — requires `GENOMICS_1000G_EAI` on `gragen-service`. Without it, ingest fails silently (pysam connection timeout).
+3. **VCF ingestion uses pysam HTTPS range requests**:
+   - 1000G: requires `GENOMICS_1000G_EAI` on `gragen-service`
+   - ClinVar: requires `NCBI_FTP_EAI` on `gragen-service`
+   - Without the EAI, ingest fails silently (pysam connection timeout)
 
-4. **Position arrays are sorted** — slicing uses `np.searchsorted` O(log n), not a full scan. Store sorted positions, or re-sort if out of order.
+4. **Position arrays are sorted** — slicing uses `np.searchsorted` O(log n), not a full scan.
 
-5. **20 MB external function limit applies to `GRAGEN_SLICE`**. Large regions (>200K variants) are auto-downsampled by stride. Use `/api/direct/variants` for the full resolution view.
+5. **20 MB external function limit applies to `GRAGEN_SLICE` and `CLINVAR_SLICE`**. Large regions are auto-downsampled by stride. Use `/api/direct/variants` and `/api/direct/clinvar` for full resolution.
 
-6. **chr22 first** — smallest autosome (~120K variants). Validate pipeline before ingesting larger chromosomes.
+6. **GRANT SERVICE ROLE required after every ALTER SERVICE** — SPCS drops endpoint grants when the service spec is updated. Always re-run:
+   ```sql
+   GRANT SERVICE ROLE GRAGEN_DB.GRAGEN.GRAGEN_ACCELERATOR_SERVICE!ALL_ENDPOINTS_USAGE TO ROLE PUBLIC;
+   GRANT SERVICE ROLE GRAGEN_DB.GRAGEN.GRAGEN_ACCELERATOR_SERVICE!ALL_ENDPOINTS_USAGE TO ROLE ICECHUNK_DB;
+   ```
+
+7. **chr22 first** — smallest autosome, validates the full pipeline in ~15 minutes total.
 
 ---
 
@@ -237,6 +310,9 @@ curl https://<URL>/api/direct/variants \
 | VCF ingest slow | Increase `max_workers` (default 16). Check SPCS compute pool is CPU_X64_S not XS |
 | `ICECHUNK_S3_EAI` missing | Re-apply EAI after ALTER SERVICE |
 | `allele_freq all zeros` | VCF GT field not found — verify sample ID matches VCF header |
+| ClinVar overlay not loading | Run `seed_clinvar` first. Check `/api/meta/clinvar` — should show chromosomes. |
+| ClinVar 502 error | Check `NCBI_FTP_EAI` is applied to `gragen-service` |
+| 403 Forbidden after service update | Re-apply endpoint grants: `GRANT SERVICE ROLE ...!ALL_ENDPOINTS_USAGE TO ROLE PUBLIC` |
 
 ---
 
@@ -244,6 +320,8 @@ curl https://<URL>/api/direct/variants \
 
 | Version | Date | Notes |
 |---------|------|-------|
+| v1.0.3 | 2026-06-07 | ClinVar overlay: IceChunk clinvar_repo/, /seed_clinvar, /direct/clinvar, CLINSIG overlay track in genome browser, CLINVAR_SLICE external function, NCBI_FTP_EAI |
+| v1.0.2 | 2026-06-07 | CSP fix (remove Google Fonts), GENOMICS_1000G_EAI created, GRAGEN_DB role + endpoint grants |
 | v1.0.1 | 2026-06-07 | Initial build: chr22 IceChunk store, cohort QC scatter, genome browser, GENOMICS_AGENT |
 
 ---
