@@ -99,3 +99,40 @@ export const CHROM_LENGTHS: Record<string, number> = {
   chr17: 83_257_441, chr18: 80_373_148, chr19: 58_617_616, chr20: 64_444_167,
   chr21: 46_709_983, chr22: 50_818_468, chrX: 156_040_895, chrY: 57_227_415,
 }
+
+// ── ClinVar types ─────────────────────────────────────────────────────────────
+
+export interface ClinVarVariant {
+  pos:           number
+  clinsig:       number   // 0=Benign … 4=Pathogenic 5=Conflicting 6=Other
+  clinsig_label: string
+  revstat:       number   // 0=no_assertion … 4=practice_guideline
+  allele_id:     number   // links to clinvar.ncbi.nlm.nih.gov/variation/{id}
+  color:         [number, number, number]
+}
+
+export interface ClinVarResult {
+  chrom:     string
+  start:     number
+  end:       number
+  count:     number
+  n_in_range: number
+  stride:    number
+  variants:  ClinVarVariant[]
+  truncated: boolean
+}
+
+export const CLINSIG_LABELS = [
+  'Benign', 'Likely benign', 'VUS', 'Likely pathogenic', 'Pathogenic',
+  'Conflicting', 'Other',
+]
+
+export const CLINSIG_COLORS: Record<number, [number, number, number]> = {
+  0: [100, 200, 100],   // Benign — green
+  1: [160, 220, 120],   // Likely benign — light green
+  2: [240, 200, 60],    // VUS — yellow
+  3: [240, 130, 40],    // Likely pathogenic — orange
+  4: [220, 40,  40],    // Pathogenic — red
+  5: [160, 100, 200],   // Conflicting — purple
+  6: [140, 140, 140],   // Other — grey
+}

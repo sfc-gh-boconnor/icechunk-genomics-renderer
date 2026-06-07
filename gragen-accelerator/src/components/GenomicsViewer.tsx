@@ -4,8 +4,9 @@ import { ScatterplotLayer } from '@deck.gl/layers'
 import { OrthographicView } from '@deck.gl/core'
 import {
   type Sample, type SampleMetrics, type Variant, type DensityBin,
-  type VariantResult, type MetaResult,
+  type VariantResult, type MetaResult, type ClinVarVariant, type ClinVarResult,
   SUPERPOP_COLORS, SUPERPOP_LABELS, VARIANT_COLORS, CHROMOSOMES, CHROM_LENGTHS,
+  CLINSIG_LABELS, CLINSIG_COLORS,
 } from '../types'
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -203,6 +204,13 @@ export default function GenomicsViewer({ onAgentContext }: { onAgentContext?: (m
   const [varResult, setVarResult] = useState<VariantResult | null>(null)
   const [browsing,  setBrowsing]  = useState(false)
   const [browseError, setBrowseError] = useState<string | null>(null)
+
+  // ── ClinVar overlay state ─────────────────────────────────────────────────
+  const [showClinVar,    setShowClinVar]    = useState(false)
+  const [clinVarResult,  setClinVarResult]  = useState<ClinVarResult | null>(null)
+  const [clinVarLoading, setClinVarLoading] = useState(false)
+  const [clinVarError,   setClinVarError]   = useState<string | null>(null)
+  const [clinVarTooltip, setClinVarTooltip] = useState<Tooltip | null>(null)
   const [varTooltip, setVarTooltip] = useState<Tooltip | null>(null)
   const [sampleMeta, setSampleMeta] = useState<SampleMetrics | null>(null)
 
@@ -290,6 +298,27 @@ export default function GenomicsViewer({ onAgentContext }: { onAgentContext?: (m
       setBrowsing(false)
     }
   }, [sampleId, chrom, startPos, endPos])
+
+  // Fetch ClinVar overlay when showClinVar is toggled on or region changes
+  const fetchClinVar = useCallback(async () => {
+    if (!showClinVar) return
+    setClinVarLoading(true)
+    setClinVarError(null)
+    try {
+      const res = await fetch('/api/direct/clinvar', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chrom, start: startPos, end: endPos }),
+      })
+      const data = await res.json() as ClinVarResult & { detail?: string }
+      if (!res.ok) { setClinVarError(data.detail ?? 'Unknown error'); return }
+      setClinVarResult(data)
+    } catch (err) {
+      setClinVarError(String(err))
+    } finally {
+      setClinVarLoading(false)
+    }
+  }, [showClinVar, chrom, startPos, endPos])
 
   // Load sample metadata when sample changes
   useEffect(() => {
@@ -411,6 +440,48 @@ export default function GenomicsViewer({ onAgentContext }: { onAgentContext?: (m
         setVarTooltip(null)
       }
     },
+  })
+
+  // ── ClinVar overlay DeckGL layer ──────────────────────────────────────────
+  // Separate ScatterplotLayer on top of the 1000G variants, coloured by
+  // clinical significance. Larger radius for high-confidence pathogenic calls.
+  const clinVarVariants: ClinVarVariant[] = clinVarResult?.variants ?? []
+  const clinVarScatterData = clinVarVariants.map(v => ({
+    ...v,
+    x: ((v.pos - startPos) / regionSize) * 1000 - 500,
+    y: 60 + (v.clinsig >= 3 ? 20 : 0),  // pathogenic floats above benign
+  }))
+  const clinVarLayer = new ScatterplotLayer({
+    id: 'clinvar',
+    data: clinVarScatterData,
+    visible: showClinVar && clinVarScatterData.length > 0,
+    getPosition: (d: typeof clinVarScatterData[0]) => [d.x, d.y, 0] as [number, number, number],
+    getFillColor: (d: typeof clinVarScatterData[0]) => {
+      const c = CLINSIG_COLORS[d.clinsig] ?? [140, 140, 140]
+      return [...c, 230] as [number, number, number, number]
+    },
+    // Pathogenic variants rendered larger for visibility
+    getRadius: (d: typeof clinVarScatterData[0]) => d.clinsig >= 3 ? 7 : 5,
+    radiusUnits: 'pixels',
+    pickable: true,
+    onHover: (info: { object?: typeof clinVarScatterData[0]; x?: number; y?: number }) => {
+      if (info.object) {
+        const v = info.object
+        setClinVarTooltip({
+          x: info.x ?? 0, y: info.y ?? 0,
+          content: {
+            '🧬 ClinVar':  `ID ${v.allele_id}`,
+            POS:           v.pos,
+            Significance:  v.clinsig_label,
+            'Review stars': '⭐'.repeat(Math.max(1, v.revstat + 1)),
+            'ClinVar link': `clinvar.ncbi.nlm.nih.gov/variation/${v.allele_id}`,
+          },
+        })
+      } else {
+        setClinVarTooltip(null)
+      }
+    },
+    updateTriggers: { visible: [showClinVar] },
   })
 
   // ── Tooltip component ─────────────────────────────────────────────────────
@@ -596,6 +667,46 @@ export default function GenomicsViewer({ onAgentContext }: { onAgentContext?: (m
               </div>
             )}
 
+            {/* ClinVar overlay toggle */}
+            <div style={{ marginTop: 10, borderTop: '1px solid var(--border)', paddingTop: 10 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+                <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', fontSize: 11, fontWeight: 600 }}>
+                  <input
+                    type="checkbox"
+                    checked={showClinVar}
+                    onChange={e => {
+                      setShowClinVar(e.target.checked)
+                      if (e.target.checked && !clinVarResult) fetchClinVar()
+                    }}
+                    style={{ accentColor: '#e53935' }}
+                  />
+                  🏥 ClinVar Overlay
+                </label>
+                {showClinVar && (
+                  <button
+                    className="btn secondary small"
+                    style={{ fontSize: 10, padding: '2px 8px', marginLeft: 'auto' }}
+                    onClick={fetchClinVar}
+                    disabled={clinVarLoading}
+                  >
+                    {clinVarLoading ? '⏳' : '↺ Refresh'}
+                  </button>
+                )}
+              </div>
+              {clinVarError && <div style={{ fontSize: 10, color: 'var(--red)' }}>⚠ {clinVarError}</div>}
+              {showClinVar && clinVarResult && (
+                <div style={{ fontSize: 10, color: 'var(--text-secondary)' }}>
+                  {clinVarResult.count.toLocaleString()} ClinVar variants
+                  {clinVarResult.variants.filter(v => v.clinsig >= 3).length > 0 && (
+                    <span style={{ color: '#e53935', marginLeft: 6 }}>
+                      ● {clinVarResult.variants.filter(v => v.clinsig === 4).length} Pathogenic
+                      / {clinVarResult.variants.filter(v => v.clinsig === 3).length} Likely Path.
+                    </span>
+                  )}
+                </div>
+              )}
+            </div>
+
             {/* Save to table */}
             <div style={{ marginTop: 10, borderTop: '1px solid var(--border)', paddingTop: 10 }}>
               <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 6 }}>Save to Snowflake Table</div>
@@ -755,11 +866,28 @@ export default function GenomicsViewer({ onAgentContext }: { onAgentContext?: (m
                     views={new OrthographicView({ id: 'variants' })}
                     initialViewState={{ target: [0, 0, 0], zoom: 0.5 }}
                     controller={true}
-                    layers={[varLayer]}
+                    layers={[varLayer, clinVarLayer]}
                     style={{ width: '100%', height: '100%' }}
                   />
-                  {varTooltip && <Tooltip tip={varTooltip} />}
+                  {varTooltip    && <Tooltip tip={varTooltip} />}
+                  {clinVarTooltip && <Tooltip tip={clinVarTooltip} />}
                 </div>
+                {/* ClinVar legend */}
+                {showClinVar && clinVarScatterData.length > 0 && (
+                  <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginTop: 4 }}>
+                    {[4,3,2,1,0,5].map(sig => {
+                      const c = CLINSIG_COLORS[sig] ?? [140,140,140]
+                      const n = clinVarVariants.filter(v => v.clinsig === sig).length
+                      if (!n) return null
+                      return (
+                        <div key={sig} style={{ display: 'flex', alignItems: 'center', gap: 3, fontSize: 9 }}>
+                          <span style={{ width: 8, height: 8, borderRadius: '50%', background: `rgb(${c.join(',')})`, flexShrink: 0 }} />
+                          <span style={{ color: 'var(--text-secondary)' }}>{CLINSIG_LABELS[sig]} ({n})</span>
+                        </div>
+                      )
+                    })}
+                  </div>
+                )}
                 <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 9, color: 'var(--text-secondary)', marginTop: 4 }}>
                   <span>{chrom}:{startPos.toLocaleString()}</span>
                   <span>{chrom}:{endPos.toLocaleString()}</span>

@@ -244,3 +244,25 @@ GRANT USAGE ON PROCEDURE GRAGEN_DB.GRAGEN.TOOL_FIND_OUTLIERS(VARCHAR, INTEGER) T
 GRANT DATABASE ROLE SNOWFLAKE.CORTEX_USER TO ROLE GRAGEN_DB;
 
 SELECT 'External functions and Cortex Agent created successfully.' AS status;
+
+-- =============================================================================
+-- CLINVAR_SLICE external function
+-- =============================================================================
+-- Queries ClinVar clinical variants in a genomic region.
+-- Input:  CLINVAR_SLICE(chrom VARCHAR, start_pos INTEGER, end_pos INTEGER)
+-- Output: VARIANT containing { variants: [{pos, clinsig, clinsig_label, ...}] }
+CREATE OR REPLACE FUNCTION GRAGEN_DB.GRAGEN.CLINVAR_SLICE(
+  CHROM     VARCHAR,
+  START_POS INTEGER,
+  END_POS   INTEGER
+)
+RETURNS VARIANT
+API_INTEGRATION = GRAGEN_API_INTEGRATION
+AS '<GRAGEN_SERVICE_ENDPOINT>/slice_clinvar';
+
+GRANT USAGE ON FUNCTION GRAGEN_DB.GRAGEN.CLINVAR_SLICE(VARCHAR, INTEGER, INTEGER)
+  TO ROLE GRAGEN_DB;
+GRANT USAGE ON FUNCTION GRAGEN_DB.GRAGEN.CLINVAR_SLICE(VARCHAR, INTEGER, INTEGER)
+  TO ROLE SYSADMIN;
+
+SELECT 'ClinVar external function created. Run seed_clinvar to populate the store.' AS status;

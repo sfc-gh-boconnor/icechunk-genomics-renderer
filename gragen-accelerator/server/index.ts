@@ -209,6 +209,24 @@ app.post('/api/direct/variants', (req: Request, res: Response) => {
   proxyToService('/direct/variants', req.body, res)
 })
 
+app.post('/api/direct/clinvar', (req: Request, res: Response) => {
+  proxyToService('/direct/clinvar', req.body, res)
+})
+
+app.post('/api/direct/seed_clinvar', (req: Request, res: Response) => {
+  proxyToService('/seed_clinvar', req.body ?? {}, res)
+})
+
+app.get('/api/meta/clinvar', async (_req: Request, res: Response) => {
+  try {
+    const upstream = await fetch(`${GRAGEN_SERVICE_URL}/meta/clinvar`)
+    const data = await upstream.json()
+    res.json(data)
+  } catch (err) {
+    res.status(502).json({ error: err instanceof Error ? err.message : String(err) })
+  }
+})
+
 app.post('/api/direct/cohort_metrics', (req: Request, res: Response) => {
   proxyToService('/direct/cohort_metrics', req.body, res)
 })

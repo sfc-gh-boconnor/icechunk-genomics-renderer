@@ -470,3 +470,192 @@ def direct_metrics(sample_id: str):
     meta_map = {s["sample_id"]: s for s in _load_sample_metadata()}
     pop_info = meta_map.get(sample_id, {})
     return {**mapping_metrics, **vc_metrics, **pop_info, "sample_id": sample_id}
+
+
+# ── ClinVar endpoints ──────────────────────────────────────────────────────────
+
+# ClinVar repo cache (separate from 1000G genomics repo)
+_clinvar_repo = None
+_clinvar_lock = threading.Lock()
+
+def _get_clinvar_root() -> zarr.Group:
+    global _clinvar_repo
+    with _clinvar_lock:
+        if _clinvar_repo is None:
+            from icechunk_client import open_or_create_clinvar_repo
+            _clinvar_repo = open_or_create_clinvar_repo()
+    session = _clinvar_repo.readonly_session("main")
+    return zarr.open_group(session.store, mode="r")
+
+CLINSIG_LABELS = ["Benign", "Likely_benign", "Uncertain_significance",
+                   "Likely_pathogenic", "Pathogenic",
+                   "Conflicting_interpretations", "Other"]
+
+CLINSIG_COLORS = {
+    0: [100, 200, 100],   # Benign — green
+    1: [160, 220, 120],   # Likely benign — light green
+    2: [240, 200, 60],    # VUS — yellow
+    3: [240, 130, 40],    # Likely pathogenic — orange
+    4: [220, 40,  40],    # Pathogenic — red
+    5: [160, 100, 200],   # Conflicting — purple
+    6: [140, 140, 140],   # Other — grey
+}
+
+
+class ClinVarRequest(BaseModel):
+    chrom:        str
+    start:        int
+    end:          int
+    max_variants: int = 50_000
+
+
+def _slice_clinvar(
+    root: zarr.Group,
+    chrom: str,
+    start: int,
+    end: int,
+    max_variants: int = 50_000,
+) -> dict:
+    """Slice ClinVar variants by genomic region — same O(log n) logic as 1000G slice."""
+    chrom = chrom if chrom.startswith("chr") else f"chr{chrom}"
+    if chrom not in root:
+        available = sorted(root.keys())
+        raise HTTPException(400, f"Chromosome {chrom} not in ClinVar store. "
+                                  f"Ingested: {available or 'none — run seed_clinvar first'}")
+
+    grp = root[chrom]
+    positions = np.array(grp["position"][:])
+    lo = int(np.searchsorted(positions, start,   side="left"))
+    hi = int(np.searchsorted(positions, end + 1, side="left"))
+    n_in_range = hi - lo
+
+    if n_in_range == 0:
+        return {"data": [], "row_count": 0, "chrom": chrom, "start": start, "end": end}
+
+    stride = max(1, n_in_range // max_variants)
+    pos_slice = positions[lo:hi:stride]
+    sig_slice = np.array(grp["clinsig"][lo:hi:stride])
+    rev_slice = np.array(grp["revstat"][lo:hi:stride])
+    aid_slice = np.array(grp["allele_id"][lo:hi:stride])
+
+    rows = [
+        {
+            "pos":       int(pos_slice[i]),
+            "clinsig":   int(sig_slice[i]),
+            "clinsig_label": CLINSIG_LABELS[min(int(sig_slice[i]), 6)],
+            "revstat":   int(rev_slice[i]),
+            "allele_id": int(aid_slice[i]),
+            "color":     CLINSIG_COLORS.get(int(sig_slice[i]), [140, 140, 140]),
+        }
+        for i in range(len(pos_slice))
+    ]
+
+    return {
+        "data":       rows,
+        "row_count":  len(rows),
+        "n_in_range": n_in_range,
+        "stride":     stride,
+        "chrom":      chrom,
+        "start":      start,
+        "end":        end,
+    }
+
+
+@app.post("/direct/clinvar")
+def direct_clinvar(req: ClinVarRequest):
+    """
+    Direct SPCS-internal ClinVar slice — no Snowflake 20 MB limit.
+    Returns ClinVar variants with clinical significance for the given region.
+    """
+    try:
+        root = _get_clinvar_root()
+    except Exception as e:
+        raise HTTPException(503, f"ClinVar store not available: {e}. Run /seed_clinvar first.")
+    result = _slice_clinvar(root, req.chrom, req.start, req.end,
+                            max_variants=req.max_variants)
+    return {
+        "chrom":      result["chrom"],
+        "start":      result["start"],
+        "end":        result["end"],
+        "count":      result["row_count"],
+        "n_in_range": result["n_in_range"],
+        "stride":     result["stride"],
+        "variants":   result["data"],
+        "truncated":  result["stride"] > 1,
+    }
+
+
+@app.post("/slice_clinvar")
+def slice_clinvar_sf(body: dict):
+    """
+    Snowflake external function: CLINVAR_SLICE(chrom, start, end).
+    Wire format: { "data": [[row_num, chrom, start, end], ...] }
+    """
+    rows = body.get("data", [])
+    results = []
+    try:
+        root = _get_clinvar_root()
+    except Exception as e:
+        for row in rows:
+            results.append([row[0], {"error": str(e)}])
+        return {"data": results}
+
+    for row in rows:
+        row_num = row[0]
+        try:
+            chrom = str(row[1])
+            start = int(row[2])
+            end   = int(row[3])
+            result = _slice_clinvar(root, chrom, start, end)
+            results.append([row_num, result])
+        except Exception as e:
+            results.append([row_num, {"error": str(e)}])
+    return {"data": results}
+
+
+@app.post("/seed_clinvar")
+def seed_clinvar(body: dict = None):
+    """
+    Trigger ClinVar VCF → IceChunk ingest.
+    Body: { "chroms": ["chr22"] }  (defaults to chr22 if omitted)
+    """
+    chroms = (body or {}).get("chroms", None)
+    logger.info(f"[seed] Starting ClinVar ingest: chroms={chroms}")
+    try:
+        from ingest_clinvar import ingest_clinvar
+        result = ingest_clinvar(chroms=chroms)
+        # Invalidate ClinVar repo cache
+        global _clinvar_repo
+        with _clinvar_lock:
+            _clinvar_repo = None
+        logger.info(f"[seed] ClinVar ingest complete: {result}")
+        return result
+    except Exception as e:
+        logger.exception("ClinVar ingest failed")
+        raise HTTPException(500, f"ClinVar ingest failed: {e}")
+
+
+@app.get("/meta/clinvar")
+def meta_clinvar():
+    """ClinVar store metadata: chromosomes ingested, variant counts by significance."""
+    chrom_info: dict[str, dict] = {}
+    try:
+        root = _get_clinvar_root()
+        for chrom in sorted(root.keys()):
+            grp = root[chrom]
+            attrs = dict(grp.attrs) if hasattr(grp, "attrs") else {}
+            chrom_info[chrom] = {
+                "n_variants":    attrs.get("n_variants",    0),
+                "n_pathogenic":  attrs.get("n_pathogenic",  0),
+                "n_likely_path": attrs.get("n_likely_path", 0),
+                "n_vus":         attrs.get("n_vus",         0),
+                "n_benign":      attrs.get("n_benign",      0),
+            }
+    except Exception:
+        pass
+    return {
+        "chromosomes_in_store": chrom_info,
+        "clinsig_labels":       CLINSIG_LABELS,
+        "clinsig_colors":       CLINSIG_COLORS,
+        "source":               "https://ftp.ncbi.nlm.nih.gov/pub/clinvar/vcf_GRCh38/",
+    }
