@@ -1,0 +1,188 @@
+name: GENOMICS_SV
+description: >
+  1000 Genomes DRAGEN genomics accelerator — chr22 variant population genetics,
+  ClinVar clinical annotations, and per-sample QC metrics.
+  Covers 1.93M variants across 3,201 DRAGEN samples with ClinVar significance,
+  allele frequencies, and cohort statistics.
+
+tables:
+  - name: CHR22_ANALYSIS
+    description: >
+      Joined view of chr22 genomic variants (from 3,201 DRAGEN samples) with
+      ClinVar clinical significance. Each row is one unique variant position
+      on chromosome 22, with its population allele frequency and (if annotated)
+      ClinVar clinical significance.
+    base_table:
+      database: GRAGEN_DB
+      schema: GRAGEN
+      table: CHR22_ANALYSIS
+    primary_key:
+      columns: [POSITION]
+    dimensions:
+      - name: VARIANT_TYPE
+        expr: VARIANT_TYPE_LABEL
+        description: Variant class — SNP, INS (insertion), DEL (deletion), MNP
+        data_type: TEXT
+        synonyms: [type, variant_class, mutation_type]
+      - name: CLINICAL_SIGNIFICANCE
+        expr: CLINICAL_SIGNIFICANCE
+        description: >
+          ClinVar clinical classification: Benign, Likely_benign,
+          Uncertain_significance (VUS), Likely_pathogenic, Pathogenic,
+          Conflicting, Other. NULL if not in ClinVar.
+        data_type: TEXT
+        synonyms: [clinsig, significance, pathogenicity]
+      - name: REVIEW_STATUS
+        expr: REVIEW_STATUS
+        description: ClinVar review confidence — expert_panel, multiple_submitters, single_submitter, no_assertion
+        data_type: TEXT
+        synonyms: [revstat, confidence, evidence_level]
+      - name: FREQ_CLASS
+        expr: FREQ_CLASS
+        description: Frequency class — common (AF≥5%), low_frequency (1-5%), rare (<1%), absent
+        data_type: TEXT
+        synonyms: [frequency_class, maf_class]
+    metrics:
+      - name: TOTAL_VARIANTS
+        expr: COUNT(*)
+        description: Total number of unique variant positions
+        synonyms: [variant_count, n_variants]
+      - name: AVG_ALLELE_FREQ
+        expr: AVG(ALLELE_FREQ)
+        description: Mean allele frequency across all variants
+        synonyms: [mean_af, average_af]
+      - name: MAX_ALLELE_FREQ
+        expr: MAX(ALLELE_FREQ)
+        description: Highest allele frequency among variants
+      - name: PATHOGENIC_COUNT
+        expr: COUNT_IF(CLINSIG = 4)
+        description: Number of Pathogenic variants (ClinVar clinsig = 4)
+        synonyms: [n_pathogenic, pathogenic_variants]
+      - name: LIKELY_PATHOGENIC_COUNT
+        expr: COUNT_IF(CLINSIG = 3)
+        description: Number of Likely Pathogenic variants
+      - name: VUS_COUNT
+        expr: COUNT_IF(CLINSIG = 2)
+        description: Number of Variants of Uncertain Significance (VUS)
+        synonyms: [uncertain_count, n_vus]
+      - name: BENIGN_COUNT
+        expr: COUNT_IF(CLINSIG IN (0, 1))
+        description: Number of Benign or Likely Benign ClinVar variants
+      - name: CLINVAR_ANNOTATED_COUNT
+        expr: COUNT_IF(CLINSIG IS NOT NULL)
+        description: Number of variants with any ClinVar annotation
+        synonyms: [n_clinvar, annotated_variants]
+      - name: COMMON_VARIANT_COUNT
+        expr: COUNT_IF(ALLELE_FREQ >= 0.05)
+        description: Variants with ≥5% allele frequency in the cohort
+      - name: RARE_VARIANT_COUNT
+        expr: COUNT_IF(ALLELE_FREQ > 0 AND ALLELE_FREQ < 0.01)
+        description: Rare variants (AF < 1%) present in at least one sample
+      - name: PATHOGENIC_COMMON_COUNT
+        expr: COUNT_IF(CLINSIG = 4 AND ALLELE_FREQ > 0.01)
+        description: Pathogenic variants with >1% cohort allele frequency
+
+  - name: SAMPLE_METRICS
+    description: >
+      Per-sample QC metrics for 2,504 samples from the 1000 Genomes Project
+      DRAGEN pipeline. Includes population labels, sequencing coverage, and
+      variant calling statistics.
+    base_table:
+      database: GRAGEN_DB
+      schema: GRAGEN
+      table: SAMPLE_METRICS
+    primary_key:
+      columns: [SAMPLE_ID]
+    dimensions:
+      - name: SAMPLE_ID
+        expr: SAMPLE_ID
+        description: 1000 Genomes sample identifier (e.g. HG00096)
+        data_type: TEXT
+        synonyms: [sample, id]
+      - name: POPULATION
+        expr: POPULATION
+        description: Population code (e.g. FIN=Finnish, GBR=British, YRI=Yoruba in Ibadan)
+        data_type: TEXT
+        synonyms: [pop, population_code]
+      - name: SUPERPOPULATION
+        expr: SUPERPOPULATION
+        description: >
+          Superpopulation group: AFR (African), AMR (Admixed American),
+          EAS (East Asian), EUR (European), SAS (South Asian)
+        data_type: TEXT
+        synonyms: [ancestry, continental_ancestry, superpop, ethnic_group]
+      - name: SEX
+        expr: SEX
+        description: Biological sex of the sample (male/female)
+        data_type: TEXT
+    metrics:
+      - name: SAMPLE_COUNT
+        expr: COUNT(*)
+        description: Total number of samples
+        synonyms: [n_samples, number_of_samples]
+      - name: AVG_COVERAGE
+        expr: AVG(MEAN_COVERAGE)
+        description: Mean sequencing coverage (depth) across samples
+        synonyms: [mean_coverage, average_depth]
+      - name: AVG_TITV_RATIO
+        expr: AVG(TITV_RATIO)
+        description: Average Ti/Tv ratio (typical WGS is ~2.0)
+        synonyms: [mean_titv, titv]
+      - name: AVG_HET_HOM_RATIO
+        expr: AVG(HET_HOM_RATIO)
+        description: Average heterozygous-to-homozygous variant ratio
+        synonyms: [het_hom, heterozygosity]
+      - name: AVG_PCT_MAPPED
+        expr: AVG(PCT_MAPPED)
+        description: Average percentage of reads mapped to the reference genome
+        synonyms: [mapping_rate, pct_mapped]
+      - name: AVG_TOTAL_VARIANTS
+        expr: AVG(TOTAL_VARIANTS)
+        description: Average total number of variants called per sample
+      - name: LOW_COVERAGE_SAMPLES
+        expr: COUNT_IF(MEAN_COVERAGE < 25)
+        description: Samples with mean coverage below 25x
+
+verified_queries:
+  - name: pathogenic_common_variants
+    question: "What pathogenic ClinVar variants on chr22 have the highest allele frequency in the cohort?"
+    sql: |
+      SELECT POSITION, ROUND(ALLELE_FREQ, 4) AS ALLELE_FREQ,
+             CLINICAL_SIGNIFICANCE, REVIEW_STATUS, CLINVAR_ALLELE_ID
+      FROM GRAGEN_DB.GRAGEN.CHR22_ANALYSIS
+      WHERE CLINSIG = 4 AND ALLELE_FREQ > 0
+      ORDER BY ALLELE_FREQ DESC
+      LIMIT 20
+
+  - name: samples_by_superpopulation
+    question: "How many samples are there in each superpopulation?"
+    sql: |
+      SELECT SUPERPOPULATION,
+             COUNT(*) AS SAMPLE_COUNT,
+             ROUND(AVG(MEAN_COVERAGE), 1) AS AVG_COVERAGE,
+             ROUND(AVG(TITV_RATIO), 3) AS AVG_TITV
+      FROM GRAGEN_DB.GRAGEN.SAMPLE_METRICS
+      GROUP BY SUPERPOPULATION
+      ORDER BY SAMPLE_COUNT DESC
+
+  - name: clinvar_breakdown
+    question: "How many variants are in each ClinVar significance category?"
+    sql: |
+      SELECT CLINICAL_SIGNIFICANCE,
+             COUNT(*) AS N_VARIANTS,
+             ROUND(AVG(ALLELE_FREQ), 4) AS AVG_AF
+      FROM GRAGEN_DB.GRAGEN.CHR22_ANALYSIS
+      WHERE CLINSIG IS NOT NULL
+      GROUP BY CLINICAL_SIGNIFICANCE, CLINSIG
+      ORDER BY CLINSIG
+
+  - name: qc_by_population
+    question: "What are the average coverage and Ti/Tv ratio for each superpopulation?"
+    sql: |
+      SELECT SUPERPOPULATION,
+             COUNT(*) AS N_SAMPLES,
+             ROUND(AVG(MEAN_COVERAGE), 1) AS AVG_COVERAGE,
+             ROUND(AVG(TITV_RATIO), 3) AS AVG_TITV
+      FROM GRAGEN_DB.GRAGEN.SAMPLE_METRICS
+      GROUP BY SUPERPOPULATION
+      ORDER BY SUPERPOPULATION
