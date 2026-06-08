@@ -38,12 +38,17 @@ Note: ClinVar VCF uses chromosome names without 'chr' prefix (1, 2, …, X).
 from __future__ import annotations
 
 import logging
+import gzip
+import io
+import logging
 import os
+import re
+import struct
+import urllib.request
 from datetime import datetime, timezone
 from typing import Optional
 
 import numpy as np
-import pysam
 import zarr
 
 from icechunk_client import open_or_create_clinvar_repo
@@ -117,16 +122,104 @@ def _encode_revstat(raw: str) -> int:
     return _REVSTAT_MAP.get(raw.strip().lower(), 0)
 
 
+def _http_range(url: str, start: int, end: int) -> bytes:
+    """Download a byte range from a URL via urllib."""
+    req = urllib.request.Request(url, headers={"Range": f"bytes={start}-{end}"})
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        return resp.read()
+
+
+def _tbi_chrom_range(tbi_bytes: bytes, chrom: str) -> tuple[int, int]:
+    """Parse bgzf-compressed TBI and return (start_byte, end_byte) for chrom."""
+    def _decompress(data: bytes) -> bytes:
+        out = []
+        buf = io.BytesIO(data)
+        while True:
+            h = buf.read(18)
+            if len(h) < 18 or h[:2] != b'\x1f\x8b':
+                break
+            bsize = struct.unpack('<H', h[16:18])[0] + 1
+            rest = buf.read(bsize - 18)
+            try:
+                out.append(gzip.decompress(h + rest))
+            except Exception:
+                break
+        return b''.join(out)
+
+    raw = _decompress(tbi_bytes)
+    buf = io.BytesIO(raw)
+    if buf.read(4) != b'TBI\x01':
+        raise ValueError("Not a TBI file")
+    n_ref = struct.unpack('<i', buf.read(4))[0]
+    buf.read(24)  # format + col_seq/beg/end + meta + skip
+    l_nm = struct.unpack('<i', buf.read(4))[0]
+    names = [n.decode() for n in buf.read(l_nm).rstrip(b'\x00').split(b'\x00')]
+    if chrom not in names:
+        raise ValueError(f"{chrom!r} not in TBI. Available: {names[:5]}")
+    chrom_idx = names.index(chrom)
+
+    all_ioffs = []
+    for _ in range(n_ref):
+        n_bin = struct.unpack('<i', buf.read(4))[0]
+        for _ in range(n_bin):
+            buf.read(4)  # bin_id
+            buf.read(struct.unpack('<i', buf.read(4))[0] * 16)  # chunks
+        n_intv = struct.unpack('<i', buf.read(4))[0]
+        all_ioffs.append([struct.unpack('<Q', buf.read(8))[0] for _ in range(n_intv)])
+
+    ti = all_ioffs[chrom_idx]
+    start_vfo = next((x for x in ti if x > 0), None)
+    if start_vfo is None:
+        raise ValueError(f"No data for {chrom!r}")
+    start = start_vfo >> 16
+    next_idx = chrom_idx + 1
+    if next_idx < len(all_ioffs) and any(x > 0 for x in all_ioffs[next_idx]):
+        end = (next(x for x in all_ioffs[next_idx] if x > 0) >> 16) + 65536
+    else:
+        end = start + 50_000_000
+    return start, end
+
+
 # ── Per-chromosome ingest ──────────────────────────────────────────────────────
 
 def _ingest_chromosome(chrom: str) -> dict:
     """
-    Read ClinVar variants for one chromosome via pysam HTTP range request.
-    Returns dict of sorted 1D numpy arrays.
+    Read ClinVar variants for one chromosome via urllib HTTP range request.
 
-    ClinVar uses 'chr1', 'chr2', ... in GRCh38 VCF (unlike some older builds).
+    Uses the TBI index to fetch only the relevant bytes (not the whole ~600 MB file).
+    urllib is used instead of pysam because libcurl does not route through SPCS's
+    EAI proxy — the same issue we solved for the genomics ingest.
     """
     logger.info(f"[clinvar] Reading {chrom} from {CLINVAR_VCF_URL}…")
+
+    # ClinVar VCF uses bare chromosome names (1, 2, ..., X) not chr-prefixed
+    tbi_chrom = chrom.removeprefix("chr")
+
+    # 1. Download TBI index (small)
+    tbi_bytes = urllib.request.urlopen(CLINVAR_TBI_URL, timeout=60).read()
+    start, end = _tbi_chrom_range(tbi_bytes, tbi_chrom)
+    logger.info(f"[clinvar] {chrom}: byte range {start:,}–{end:,} ({(end-start)//1024:,} KB)")
+
+    # 2. Download only the chromosome's bgzf blocks
+    vcf_bytes = _http_range(CLINVAR_VCF_URL, start, end)
+
+    # 3. Decompress and parse VCF lines
+    def _decompress_bgzf_str(data: bytes) -> str:
+        out = []
+        buf = io.BytesIO(data)
+        while True:
+            h = buf.read(18)
+            if len(h) < 18 or h[:2] != b'\x1f\x8b':
+                break
+            bsize = struct.unpack('<H', h[16:18])[0] + 1
+            rest = buf.read(bsize - 18)
+            try:
+                out.append(gzip.decompress(h + rest).decode('utf-8', errors='replace'))
+            except Exception:
+                break
+        return ''.join(out)
+
+    text = _decompress_bgzf_str(vcf_bytes)
 
     positions: list[int]  = []
     clinsigs:  list[int]  = []
@@ -135,30 +228,36 @@ def _ingest_chromosome(chrom: str) -> dict:
     ref_lens:  list[int]  = []
     alt_lens:  list[int]  = []
 
-    try:
-        with pysam.VariantFile(CLINVAR_VCF_URL, index_filename=CLINVAR_TBI_URL) as vcf:
-            for rec in vcf.fetch(chrom):
-                info = rec.info
-                clnsig    = info.get("CLNSIG",    "")
-                revstat   = info.get("CLNREVSTAT", "")
-                allele_id = info.get("ALLELEID",   0)
-                alts      = rec.alts or (".",)
+    for line in text.splitlines():
+        if not line or line.startswith('#'):
+            continue
+        parts = line.split('\t', 9)
+        if len(parts) < 8 or parts[0] != tbi_chrom:  # ClinVar uses bare chrom names
+            continue
+        _, pos_str, _, ref, alt_str, _, _, info_str = parts[:8]
+        try:
+            pos = int(pos_str)
+        except ValueError:
+            continue
 
-                # CLNSIG in pysam is a tuple — join to string
-                if isinstance(clnsig, (list, tuple)):
-                    clnsig = "|".join(str(x) for x in clnsig)
-                if isinstance(revstat, (list, tuple)):
-                    revstat = ",_".join(str(x) for x in revstat)
+        # Parse INFO fields
+        info: dict = {}
+        for kv in info_str.split(';'):
+            if '=' in kv:
+                k, v = kv.split('=', 1)
+                info[k] = v
 
-                positions.append(rec.pos)
-                clinsigs.append(_encode_clinsig(str(clnsig)))
-                revstats.append(_encode_revstat(str(revstat)))
-                allele_ids.append(int(allele_id) if allele_id else 0)
-                ref_lens.append(min(len(rec.ref), 127))
-                alt_lens.append(min(len(alts[0]) if alts else 1, 127))
-    except Exception as e:
-        logger.error(f"[clinvar] Error reading {chrom}: {e}")
-        raise
+        clnsig    = info.get('CLNSIG', '')
+        revstat   = info.get('CLNREVSTAT', '')
+        allele_id = info.get('ALLELEID', '0')
+        alts      = alt_str.split(',')
+
+        positions.append(pos)
+        clinsigs.append(_encode_clinsig(clnsig))
+        revstats.append(_encode_revstat(revstat))
+        allele_ids.append(int(allele_id) if allele_id.isdigit() else 0)
+        ref_lens.append(min(len(ref), 127))
+        alt_lens.append(min(len(alts[0]) if alts else 1, 127))
 
     if not positions:
         logger.warning(f"[clinvar] {chrom}: no variants found")
@@ -195,12 +294,13 @@ def _write_clinvar_chromosome(root: zarr.Group, chrom: str, arrays: dict) -> Non
         del root[chrom]
 
     grp = root.require_group(chrom)
-    grp.create_array("position",  data=arrays["position"],  chunks=chunks, dtype=np.int32, overwrite=True)
-    grp.create_array("clinsig",   data=arrays["clinsig"],   chunks=chunks, dtype=np.int8,  overwrite=True)
-    grp.create_array("revstat",   data=arrays["revstat"],   chunks=chunks, dtype=np.int8,  overwrite=True)
-    grp.create_array("allele_id", data=arrays["allele_id"], chunks=chunks, dtype=np.int32, overwrite=True)
-    grp.create_array("ref_len",   data=arrays["ref_len"],   chunks=chunks, dtype=np.int8,  overwrite=True)
-    grp.create_array("alt_len",   data=arrays["alt_len"],   chunks=chunks, dtype=np.int8,  overwrite=True)
+    # Zarr v3: data= and dtype= are mutually exclusive — dtype inferred from numpy array
+    grp.create_array("position",  data=arrays["position"],  chunks=chunks, overwrite=True)
+    grp.create_array("clinsig",   data=arrays["clinsig"],   chunks=chunks, overwrite=True)
+    grp.create_array("revstat",   data=arrays["revstat"],   chunks=chunks, overwrite=True)
+    grp.create_array("allele_id", data=arrays["allele_id"], chunks=chunks, overwrite=True)
+    grp.create_array("ref_len",   data=arrays["ref_len"],   chunks=chunks, overwrite=True)
+    grp.create_array("alt_len",   data=arrays["alt_len"],   chunks=chunks, overwrite=True)
 
     grp.attrs.update({
         "n_variants":       n,

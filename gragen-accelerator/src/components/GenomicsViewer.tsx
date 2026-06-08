@@ -223,8 +223,8 @@ export default function GenomicsViewer({ onAgentContext }: { onAgentContext?: (m
   // ── Load meta on mount ────────────────────────────────────────────────────
   useEffect(() => {
     fetch('/api/meta')
-      .then(r => r.json())
-      .then(d => setMeta(d as MetaResult))
+      .then(r => r.ok ? r.json() : Promise.reject(r.status))
+      .then(d => { if (d?.sample_count != null) setMeta(d as MetaResult) })
       .catch(console.error)
   }, [])
 
@@ -516,7 +516,7 @@ export default function GenomicsViewer({ onAgentContext }: { onAgentContext?: (m
           </div>
           <div style={{ fontSize: 10, color: 'var(--text-secondary)' }}>
             1000 Genomes · DRAGEN 3.7.6 · hg38
-            {meta && ` · ${meta.sample_count.toLocaleString()} samples`}
+            {meta?.sample_count != null && ` · ${meta.sample_count.toLocaleString()} samples`}
           </div>
         </div>
 

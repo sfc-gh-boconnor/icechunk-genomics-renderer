@@ -42,6 +42,7 @@ from pydantic import BaseModel
 from icechunk_client import open_or_create_genomics_repo, open_genomics_repo
 
 logging.basicConfig(level=logging.INFO)
+logging.getLogger("ingest_genomics").setLevel(logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -79,6 +80,7 @@ SUPERPOP_COLORS = {
 
 _repo = None
 _repo_lock = threading.Lock()
+_seeding = threading.Event()   # set while a genomics seed is running
 
 def _get_repo():
     global _repo
@@ -222,16 +224,13 @@ def _slice_genomic(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("GRAGEN service starting — connecting to IceChunk repo")
-    try:
-        root = _get_root()
-        ingested = sorted(root.keys())
-        logger.info(f"IceChunk store ready. Chromosomes: {ingested or 'empty (run seed_genomics)'}")
-    except Exception as e:
-        logger.warning(f"IceChunk store not ready yet: {e}")
+    # Don't connect to IceChunk S3 at startup — connect lazily on first request.
+    # Connecting at startup blocks the readiness probe if S3 is slow to respond.
+    logger.info("GRAGEN service started. IceChunk store will connect on first request.")
     yield
     logger.info("GRAGEN service shutting down")
 
-app = FastAPI(title="GRAGEN Service", version="1.0.1", lifespan=lifespan)
+app = FastAPI(title="GRAGEN Service", version="1.0.17", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"],
                    allow_methods=["*"], allow_headers=["*"])
 
@@ -253,7 +252,7 @@ class SeedRequest(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "1.0.1"}
+    return {"status": "ok", "version": "1.0.17"}
 
 @app.get("/meta")
 def meta():
@@ -290,6 +289,12 @@ def meta():
         "reference":        "hg38-graph-based",
         "data_source":      f"s3://{SRC_BUCKET}",
     }
+
+@app.post("/meta")
+def meta_sf():
+    """POST version of /meta for Snowflake service-function wire format."""
+    return {"data": [[0, meta()]]}
+
 
 @app.get("/samples")
 def samples(superpop: Optional[str] = None,
@@ -364,29 +369,56 @@ def slice_variants(body: dict):
     return {"data": results}
 
 @app.post("/seed_genomics")
-def seed_genomics(req: SeedRequest):
+def seed_genomics(body: dict = None):
     """
-    Trigger VCF → IceChunk ingest pipeline.
-    Mirrors /seed_uk from the weather project.
+    Trigger VCF → IceChunk ingest pipeline (fire-and-forget).
+
+    Accepts both Snowflake service-function wire format
+      { "data": [[row_num, chroms_array, max_workers]] }
+    and plain JSON { "chroms": [...], "max_workers": N }.
+
+    Returns immediately with {"data": [[0, {"status": "seeding", ...}]]}.
+    The actual ingest runs in a daemon thread; poll /meta to check completion.
+
+    Pysam/htslib is NOT thread-safe under concurrent curl_global_init, so
+    the ingest always uses max_workers=1 (serial VCF reads, ~8 min for chr22).
     """
-    logger.info(f"[seed] Starting genomics ingest: chroms={req.chroms}, "
-                f"workers={req.max_workers}")
-    try:
-        from ingest_genomics import ingest_genomics
-        result = ingest_genomics(
-            chroms=req.chroms,
-            sample_ids=req.sample_ids,
-            max_workers=req.max_workers,
-        )
-        # Invalidate repo cache so next read gets the new snapshot
-        global _repo
-        with _repo_lock:
-            _repo = None
-        logger.info(f"[seed] Ingest complete: {result}")
-        return result
-    except Exception as e:
-        logger.exception("Genomics ingest failed")
-        raise HTTPException(500, f"Ingest failed: {e}")
+    body = body or {}
+
+    # Parse Snowflake service-function wire format: {"data": [[row_num, chroms, workers], ...]}
+    if "data" in body and body["data"]:
+        row = body["data"][0]
+        target_chroms = row[1] if len(row) > 1 and row[1] else ["chr22"]
+    else:
+        target_chroms = body.get("chroms") or ["chr22"]
+
+    if _seeding.is_set():
+        return {"data": [[0, {"status": "already_running",
+                              "message": "Seed already in progress"}]]}
+
+    logger.info(f"[seed] Queuing background ingest: chroms={target_chroms}")
+
+    def _run():
+        _seeding.set()
+        try:
+            from ingest_genomics import ingest_genomics
+            result = ingest_genomics(
+                chroms=target_chroms,
+                sample_ids=None,
+                max_workers=int(os.environ.get("INGEST_WORKERS", "1")),
+            )
+            global _repo
+            with _repo_lock:
+                _repo = None            # invalidate cache → next read sees new snapshot
+            logger.info(f"[seed] Ingest complete: {result}")
+        except Exception:
+            logger.exception("[seed] Genomics ingest failed")
+        finally:
+            _seeding.clear()
+
+    threading.Thread(target=_run, daemon=True, name="genomics-ingest").start()
+    return {"data": [[0, {"status": "seeding", "chroms": target_chroms,
+                          "message": "Seed running in background. Poll /meta when ready."}]]}
 
 @app.get("/direct/metrics/{sample_id}")
 def direct_metrics(sample_id: str):
