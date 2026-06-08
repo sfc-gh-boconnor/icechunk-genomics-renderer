@@ -281,8 +281,47 @@ curl -X POST https://<URL>/api/direct/seed_clinvar \
 
 2. **Reuses weather project's S3 bucket** — prefixes are `genomics_repo/` and `clinvar_repo/`. The `AWS_ACCESS_KEY_ID` secret must have write access to `icechunk-ro`.
 
-3. **VCF ingestion uses pysam HTTPS range requests**:
-   - 1000G: requires `GENOMICS_1000G_EAI` on `gragen-service`
+3. **VCF ingestion uses boto3/urllib HTTP range requests via TBI index** (NOT pysam):
+   - pysam/libcurl does NOT route through SPCS's EAI proxy — causes silent hangs
+   - boto3 (for S3) and urllib (for NCBI HTTPS) DO use the proxy correctly
+   - `ingest_genomics.py` downloads TBI index → finds byte range → boto3 S3 Range request
+   - `ingest_clinvar.py` downloads TBI index → finds byte range → urllib Range request
+
+4. **Seed via EXECUTE JOB SERVICE** (not service functions or direct HTTP):
+   - Service restarts kill background threads — EXECUTE JOB SERVICE is isolated
+   - `GRAGEN_INGEST_POOL` (CPU_X64_L, 16 vCPU) with `AUTO_SUSPEND_SECS=60`
+   - Genomics seed: 3201 samples, 8 parallel workers, ~25 min for chr22
+   - ClinVar seed: single file, ~2 min for chr22
+   ```sql
+   -- Genomics chr22 seed:
+   EXECUTE JOB SERVICE
+     IN COMPUTE POOL GRAGEN_INGEST_POOL
+     NAME = GRAGEN_DB.GRAGEN.GRAGEN_SEED_JOB
+     EXTERNAL_ACCESS_INTEGRATIONS = (ICECHUNK_S3_EAI, GENOMICS_1000G_EAI)
+     FROM SPECIFICATION $$
+   spec:
+     containers:
+     - name: seed
+       image: /gragen_db/gragen/gragen_repo/gragen-service:1.0.17
+       command: ["python3", "/app/seed_job.py"]
+       env:
+         SEED_TYPE: genomics
+         SEED_CHROMS: chr22
+         ICECHUNK_BUCKET: icechunk-ro
+         ICECHUNK_GENOMICS_PREFIX: genomics_repo
+         AWS_DEFAULT_REGION: us-west-2
+         INGEST_WORKERS: "8"
+       secrets:
+       - snowflakeSecret: ICECHUNK_DB.ICECHUNK.AWS_ACCESS_KEY_ID
+         envVarName: AWS_ACCESS_KEY_ID
+       - snowflakeSecret: ICECHUNK_DB.ICECHUNK.AWS_SECRET_ACCESS_KEY
+         envVarName: AWS_SECRET_ACCESS_KEY
+   $$;
+
+   -- ClinVar chr22 seed (same but SEED_TYPE: clinvar, use NCBI_FTP_EAI):
+   EXECUTE JOB SERVICE ...
+   ```
+   After each DROP + re-run, verify with: `SELECT GRAGEN_DB.GRAGEN.GRAGEN_META();`
    - ClinVar: requires `NCBI_FTP_EAI` on `gragen-service`
    - Without the EAI, ingest fails silently (pysam connection timeout)
 
@@ -320,6 +359,7 @@ curl -X POST https://<URL>/api/direct/seed_clinvar \
 
 | Version | Date | Notes |
 |---------|------|-------|
+| v1.0.17 | 2026-06-08 | Production release: chr22 genomics (1.93M variants, 3201 samples) + ClinVar seeded. Replaced pysam HTTP with boto3/urllib TBI range requests (SPCS EAI proxy fix). seed_job.py for EXECUTE JOB SERVICE. POST /meta endpoint. int8→int16 for ref_len. Zarr create_array dtype fix. |
 | v1.0.3 | 2026-06-07 | ClinVar overlay: IceChunk clinvar_repo/, /seed_clinvar, /direct/clinvar, CLINSIG overlay track in genome browser, CLINVAR_SLICE external function, NCBI_FTP_EAI |
 | v1.0.2 | 2026-06-07 | CSP fix (remove Google Fonts), GENOMICS_1000G_EAI created, GRAGEN_DB role + endpoint grants |
 | v1.0.1 | 2026-06-07 | Initial build: chr22 IceChunk store, cohort QC scatter, genome browser, GENOMICS_AGENT |
