@@ -13,7 +13,20 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ── Load deployment config (bucket / prefix / region) ─────────────────────────
+if [[ -f "${SCRIPT_DIR}/config.env" ]]; then
+  # shellcheck disable=SC1090
+  source "${SCRIPT_DIR}/config.env"
+else
+  echo "ERROR: config.env not found. Copy config.env.example to config.env and edit it (run setup.sh first)." >&2
+  exit 1
+fi
+
 CONNECTION="${GRAGEN_CONNECTION:-internal-marketplace}"
+S3_BUCKET="${S3_BUCKET:?set in config.env}"
+DEPLOY_PREFIX="${DEPLOY_PREFIX:?set in config.env}"
+AWS_REGION="${AWS_REGION:-us-west-2}"
 CURRENT_VERSION=$(cat "${SCRIPT_DIR}/VERSION" 2>/dev/null | tr -d '[:space:]' || echo "latest")
 
 # ── Parse flags ───────────────────────────────────────────────────────────────
@@ -93,25 +106,24 @@ fi
 # ── Deploy backend ────────────────────────────────────────────────────────────
 if $DEPLOY_BACKEND; then
   echo ">>> Deploying gragen-service:${SERVICE_VERSION}…"
-  snow sql -c "$CONNECTION" -q "
-ALTER SERVICE GRAGEN_DB.GRAGEN.GRAGEN_SERVICE FROM SPECIFICATION \$\$
+  read -r -d '' BACKEND_SPEC <<EOF || true
 spec:
   containers:
   - name: gragen-service
     image: /${DB}/${SCHEMA}/gragen_repo/gragen-service:${SERVICE_VERSION}
     env:
-      PYTHONUNBUFFERED:           \"1\"
-      ICECHUNK_BUCKET:            \"icechunk-ro\"
-      ICECHUNK_GENOMICS_PREFIX:   \"genomics_repo\"
-      ICECHUNK_CLINVAR_PREFIX:    \"clinvar_repo\"
-      AWS_DEFAULT_REGION:         \"us-west-2\"
-      INGEST_WORKERS:             \"16\"
+      PYTHONUNBUFFERED:           "1"
+      ICECHUNK_BUCKET:            "${S3_BUCKET}"
+      ICECHUNK_GENOMICS_PREFIX:   "${DEPLOY_PREFIX}/genomics_repo"
+      ICECHUNK_CLINVAR_PREFIX:    "${DEPLOY_PREFIX}/clinvar_repo"
+      AWS_DEFAULT_REGION:         "${AWS_REGION}"
+      INGEST_WORKERS:             "16"
     secrets:
     - snowflakeSecret:
-        objectName: ICECHUNK_DB.ICECHUNK.AWS_ACCESS_KEY_ID
+        objectName: GRAGEN_DB.GRAGEN.AWS_ACCESS_KEY_ID
       envVarName: AWS_ACCESS_KEY_ID
     - snowflakeSecret:
-        objectName: ICECHUNK_DB.ICECHUNK.AWS_SECRET_ACCESS_KEY
+        objectName: GRAGEN_DB.GRAGEN.AWS_SECRET_ACCESS_KEY
       envVarName: AWS_SECRET_ACCESS_KEY
     readinessProbe:
       port: 8080
@@ -120,6 +132,17 @@ spec:
   - name: api-endpoint
     port: 8080
     public: false
+EOF
+  # First run: create the service (no-op if it already exists). Redeploys: ALTER updates the spec.
+  snow sql -c "$CONNECTION" -q "CREATE SERVICE IF NOT EXISTS GRAGEN_DB.GRAGEN.GRAGEN_SERVICE
+  IN COMPUTE POOL GRAGEN_COMPUTE_POOL
+  FROM SPECIFICATION \$\$
+${BACKEND_SPEC}
+\$\$
+  EXTERNAL_ACCESS_INTEGRATIONS = (ICECHUNK_S3_EAI, GENOMICS_1000G_EAI)
+  MIN_INSTANCES = 1 MAX_INSTANCES = 2;"
+  snow sql -c "$CONNECTION" -q "ALTER SERVICE GRAGEN_DB.GRAGEN.GRAGEN_SERVICE FROM SPECIFICATION \$\$
+${BACKEND_SPEC}
 \$\$"
   echo ">>> Re-applying backend EAI…"
   snow sql -c "$CONNECTION" -q "ALTER SERVICE GRAGEN_DB.GRAGEN.GRAGEN_SERVICE SET EXTERNAL_ACCESS_INTEGRATIONS = (ICECHUNK_S3_EAI, GENOMICS_1000G_EAI);"
@@ -129,8 +152,7 @@ fi
 # ── Deploy frontend ───────────────────────────────────────────────────────────
 if $DEPLOY_ACCEL; then
   echo ">>> Deploying gragen-accelerator:${ACCEL_VERSION}…"
-  snow sql -c "$CONNECTION" -q "
-ALTER SERVICE GRAGEN_DB.GRAGEN.GRAGEN_ACCELERATOR_SERVICE FROM SPECIFICATION \$\$
+  read -r -d '' ACCEL_SPEC <<EOF || true
 spec:
   containers:
   - name: gragen-accelerator
@@ -145,9 +167,21 @@ spec:
   - name: http-endpoint
     port: 3001
     public: true
+EOF
+  snow sql -c "$CONNECTION" -q "CREATE SERVICE IF NOT EXISTS GRAGEN_DB.GRAGEN.GRAGEN_ACCELERATOR_SERVICE
+  IN COMPUTE POOL GRAGEN_COMPUTE_POOL
+  FROM SPECIFICATION \$\$
+${ACCEL_SPEC}
+\$\$
+  EXTERNAL_ACCESS_INTEGRATIONS = (GRAGEN_MAP_TILES_EAI)
+  MIN_INSTANCES = 1 MAX_INSTANCES = 1;"
+  snow sql -c "$CONNECTION" -q "ALTER SERVICE GRAGEN_DB.GRAGEN.GRAGEN_ACCELERATOR_SERVICE FROM SPECIFICATION \$\$
+${ACCEL_SPEC}
 \$\$"
   echo ">>> Re-applying frontend EAIs…"
-  snow sql -c "$CONNECTION" -q "ALTER SERVICE GRAGEN_DB.GRAGEN.GRAGEN_ACCELERATOR_SERVICE SET EXTERNAL_ACCESS_INTEGRATIONS = (GRAGEN_MAP_TILES_EAI, GRAGEN_FONTS_EAI);"
+  snow sql -c "$CONNECTION" -q "ALTER SERVICE GRAGEN_DB.GRAGEN.GRAGEN_ACCELERATOR_SERVICE SET EXTERNAL_ACCESS_INTEGRATIONS = (GRAGEN_MAP_TILES_EAI);"
+  echo ">>> Re-applying frontend endpoint grants…"
+  snow sql -c "$CONNECTION" -q "GRANT SERVICE ROLE GRAGEN_DB.GRAGEN.GRAGEN_ACCELERATOR_SERVICE!ALL_ENDPOINTS_USAGE TO ROLE PUBLIC;" || true
   echo ">>> Frontend deployed."
 fi
 

@@ -7,38 +7,23 @@
 --   snow sql -f sql/02_external_functions.sql -c <CONNECTION>
 -- =============================================================================
 
-USE ROLE SYSADMIN;
+-- Runs as the connection's role (must be ACCOUNTADMIN; no USE ROLE so this works
+-- in PAT-restricted sessions too).
 USE SCHEMA GRAGEN_DB.GRAGEN;
 USE WAREHOUSE GRAGEN_WH;
 
--- ── API Integration for external function ─────────────────────────────────────
--- Replace <GRAGEN_SERVICE_ENDPOINT> with the URL from:
---   SHOW ENDPOINTS IN SERVICE GRAGEN_DB.GRAGEN.GRAGEN_SERVICE;
--- It will look like: https://abc123-account.snowflakecomputing.app
+-- App service-identity role (grants below target it). setup.sh creates role
+-- GRAGEN_DB; GRAGEN_DB_ROLE is the legacy/app role name — ensure it exists so
+-- the grants succeed on a fresh account too.
+CREATE ROLE IF NOT EXISTS GRAGEN_DB_ROLE;
 
-CREATE OR REPLACE API INTEGRATION GRAGEN_API_INTEGRATION
-  API_PROVIDER = aws_private_api_gateway  -- not actually AWS; Snowflake manages this
-  API_AWS_ROLE_ARN = ''
-  ENABLED = TRUE
-  API_ALLOWED_PREFIXES = ('<GRAGEN_SERVICE_ENDPOINT>');
-
--- Note: For SPCS-hosted functions, the integration type is actually:
--- API_PROVIDER = snowflake_service_integration
--- The exact syntax depends on your Snowflake version. Adjust if needed.
-
--- ── GRAGEN_SLICE external function ───────────────────────────────────────────
--- Queries variants in a genomic region for a given sample.
--- Input:  (sample_id VARCHAR, chrom VARCHAR, start_pos INTEGER, end_pos INTEGER)
--- Output: VARIANT containing { variants: [...], count: int, density: [...] }
-CREATE OR REPLACE FUNCTION GRAGEN_DB.GRAGEN.GRAGEN_SLICE(
-  SAMPLE_ID  VARCHAR,
-  CHROM      VARCHAR,
-  START_POS  INTEGER,
-  END_POS    INTEGER
-)
-RETURNS VARIANT
-API_INTEGRATION = GRAGEN_API_INTEGRATION
-AS '<GRAGEN_SERVICE_ENDPOINT>/slice';
+-- ── (Optional, legacy) GRAGEN_SLICE / CLINVAR_SLICE external functions ────────
+-- DISABLED for fresh-account / parameterized deploys: these used an API
+-- integration with a hardcoded <GRAGEN_SERVICE_ENDPOINT> placeholder, which
+-- can't be created automatically. The app reads variants/ClinVar via the
+-- backend's /api/direct/* endpoints and Iceberg via /api/query, so these
+-- external functions are not required. To enable them, configure an SPCS
+-- service function against GRAGEN_SERVICE manually.
 
 -- ── Cortex Agent ─────────────────────────────────────────────────────────────
 -- Tool stored procedures called by the GENOMICS_AGENT
@@ -466,23 +451,6 @@ GRANT USAGE ON PROCEDURE GRAGEN_DB.GRAGEN.TOOL_PEDIGREE(VARCHAR) TO ROLE GRAGEN_
 SELECT 'External functions and Cortex Agent created successfully.' AS status;
 
 -- =============================================================================
--- CLINVAR_SLICE external function
+-- CLINVAR_SLICE external function — DISABLED (see note above; needs a manually
+-- configured SPCS service function + endpoint). The app uses /api/direct/clinvar.
 -- =============================================================================
--- Queries ClinVar clinical variants in a genomic region.
--- Input:  CLINVAR_SLICE(chrom VARCHAR, start_pos INTEGER, end_pos INTEGER)
--- Output: VARIANT containing { variants: [{pos, clinsig, clinsig_label, ...}] }
-CREATE OR REPLACE FUNCTION GRAGEN_DB.GRAGEN.CLINVAR_SLICE(
-  CHROM     VARCHAR,
-  START_POS INTEGER,
-  END_POS   INTEGER
-)
-RETURNS VARIANT
-API_INTEGRATION = GRAGEN_API_INTEGRATION
-AS '<GRAGEN_SERVICE_ENDPOINT>/slice_clinvar';
-
-GRANT USAGE ON FUNCTION GRAGEN_DB.GRAGEN.CLINVAR_SLICE(VARCHAR, INTEGER, INTEGER)
-  TO ROLE GRAGEN_DB;
-GRANT USAGE ON FUNCTION GRAGEN_DB.GRAGEN.CLINVAR_SLICE(VARCHAR, INTEGER, INTEGER)
-  TO ROLE SYSADMIN;
-
-SELECT 'ClinVar external function created. Run seed_clinvar to populate the store.' AS status;

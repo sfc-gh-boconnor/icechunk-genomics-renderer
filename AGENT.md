@@ -26,18 +26,24 @@ Services: `GRAGEN_DB.GRAGEN.GRAGEN_SERVICE` (backend, 8080) ·
 
 ## Storage model (do not violate)
 
-- **Cohort variant / sample data → IceChunk Zarr only** (`s3://icechunk-ro/genomics_repo/`).
+- **Bring your own bucket + unique prefix.** All storage is namespaced under a deployer-chosen
+  `DEPLOY_PREFIX` (in `config.env`) inside the deployer's own S3 bucket. `setup.sh` renders the
+  SQL templates and creates `GENOMICS_ICEBERG_VOLUME` pointed at
+  `s3://<bucket>/<prefix>/iceberg/`. Never hardcode a bucket name in code.
+- **Cohort variant / sample data → IceChunk Zarr only** (`s3://<bucket>/<prefix>/genomics_repo/`).
   Never materialise to a Snowflake table — too large.
 - **Annotations → Snowflake Iceberg** (`EXTERNAL_VOLUME='GENOMICS_ICEBERG_VOLUME'
-  ICEBERG_VERSION=2 CATALOG='SNOWFLAKE'`). The frontend queries these via `/api/query`,
-  so **adding/refreshing an annotation source needs no backend rebuild.**
+  ICEBERG_VERSION=2 CATALOG='SNOWFLAKE'`, relative `BASE_LOCATION`s under the volume base).
+  The frontend queries these via `/api/query`, so **adding/refreshing an annotation source
+  needs no backend rebuild.** External volumes authenticate via an **IAM role**
+  (`ICEBERG_ROLE_ARN`), not access keys.
 
 ### Iceberg annotation tables (genome-wide despite `CHR22_` prefix)
 
 | Table | Builder | Key columns |
 |-------|---------|-------------|
-| `CHR22_CLINVAR` (~4.43M) | `app/build_clinvar_iceberg.py` | `CHROM, POSITION, CLINSIG, REVSTAT, ALLELE_ID, REF_LEN, ALT_LEN, DISEASE, GENE` |
-| `CHR22_GWAS` | `app/build_gwas_iceberg.py` | `CHROM, POSITION, TRAIT, MAPPED_GENE, RSID, RISK_ALLELE, P_VALUE` |
+| `CHR22_CLINVAR` (~4.43M) | DDL `sql/04_annotation_tables.sql` + `app/build_clinvar_iceberg.py` | `CHROM, POSITION, CLINSIG, REVSTAT, ALLELE_ID, REF_LEN, ALT_LEN, DISEASE, GENE` |
+| `CHR22_GWAS` | DDL `sql/04_annotation_tables.sql` + `app/build_gwas_iceberg.py` | `CHROM, POSITION, TRAIT, MAPPED_GENE, RSID, RISK_ALLELE, P_VALUE` |
 | `AUTISM_GENES` (25) | `app/build_sfari_iceberg.sql` | `GENE, CHROM, START_POS, END_POS, SFARI_SCORE, NOTE` |
 | `SAMPLE_PEDIGREE` (3202) | `app/build_pedigree_iceberg.py` + `.sql` | `SAMPLE_ID, FATHER_ID, MOTHER_ID, SEX, RELATIONSHIP` — 1000G trio pedigree (father/mother links; 608 children) |
 
@@ -77,11 +83,13 @@ python3 app/build_gwas_iceberg.py       # EBI GWAS → /tmp/gwas_all.csv
 1. **`ALTER SERVICE … FROM SPECIFICATION` replaces the WHOLE spec.** Any omitted
    `env:` / `secrets:` block is dropped. The `gragen-service` spec MUST always include
    the ICECHUNK env vars **and** the AWS secrets, or S3 access breaks (503 / repo not found).
-   `deploy.sh` and `sql/03_deploy_services.sql` are the source of truth — keep them complete.
+   `deploy.sh` (sources `config.env`) and `sql/03_deploy_services.sql.tmpl` are the source of
+   truth — keep them complete.
 
-2. **AWS secret names are `ICECHUNK_DB.ICECHUNK.AWS_ACCESS_KEY_ID` /
-   `AWS_SECRET_ACCESS_KEY`** (NO `ICECHUNK_` prefix). Wrong names fail with
-   "Secret … does not exist or not authorized" and the ALTER silently leaves the old spec.
+2. **AWS secrets are self-contained: `GRAGEN_DB.GRAGEN.AWS_ACCESS_KEY_ID` /
+   `AWS_SECRET_ACCESS_KEY`** (created by `setup.sh`; NO `ICECHUNK_DB`, NO `ICECHUNK_` prefix).
+   Wrong names fail with "Secret … does not exist or not authorized" and the ALTER silently
+   leaves the old spec.
 
 3. **Re-apply EAIs after every backend `ALTER SERVICE`:**
    `SET EXTERNAL_ACCESS_INTEGRATIONS = (ICECHUNK_S3_EAI, GENOMICS_1000G_EAI)`.

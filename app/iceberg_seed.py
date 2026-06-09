@@ -23,7 +23,7 @@ import zarr
 import icechunk
 from icechunk.storage import s3_storage
 
-BUCKET           = os.environ.get("ICECHUNK_BUCKET",          "icechunk-ro")
+BUCKET           = os.environ.get("ICECHUNK_BUCKET",          "REPLACE_ME_SET_ICECHUNK_BUCKET")
 GENOMICS_PREFIX  = os.environ.get("ICECHUNK_GENOMICS_PREFIX", "genomics_repo")
 CLINVAR_PREFIX   = os.environ.get("ICECHUNK_CLINVAR_PREFIX",  "clinvar_repo")
 REGION           = os.environ.get("AWS_DEFAULT_REGION",       "us-west-2")

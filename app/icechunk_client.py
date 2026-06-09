@@ -1,18 +1,21 @@
 """
 icechunk_client.py — open/create IceChunk repositories on S3.
 
-Three repos supported (all in the same S3 bucket, different prefixes):
-  - Genomics 1000G   (ICECHUNK_GENOMICS_PREFIX, default genomics_repo)
-  - ClinVar          (ICECHUNK_CLINVAR_PREFIX,  default clinvar_repo)
+Two repos supported (same bucket, different prefixes):
+  - Genomics 1000G   (ICECHUNK_GENOMICS_PREFIX)
+  - ClinVar          (ICECHUNK_CLINVAR_PREFIX)
 
-Both live in the same S3 bucket (ICECHUNK_BUCKET, default icechunk-ro).
-This avoids creating separate buckets / IAM users per dataset.
+All storage is namespaced under a unique deploy prefix inside the deployer's
+OWN S3 bucket, e.g.:
+  s3://<ICECHUNK_BUCKET>/<prefix>/genomics_repo/
+  s3://<ICECHUNK_BUCKET>/<prefix>/clinvar_repo/
+These env vars are set by the SPCS service spec (see deploy.sh / config.env).
 """
 import os
 import icechunk
 from icechunk.storage import s3_storage
 
-BUCKET          = os.environ.get("ICECHUNK_BUCKET",          "icechunk-ro")
+BUCKET          = os.environ.get("ICECHUNK_BUCKET",          "REPLACE_ME_SET_ICECHUNK_BUCKET")
 REGION          = os.environ.get("AWS_DEFAULT_REGION",        "us-west-2")
 GENOMICS_PREFIX = os.environ.get("ICECHUNK_GENOMICS_PREFIX",  "genomics_repo")
 CLINVAR_PREFIX  = os.environ.get("ICECHUNK_CLINVAR_PREFIX",   "clinvar_repo")

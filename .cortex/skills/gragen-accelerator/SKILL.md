@@ -27,7 +27,7 @@ genomic position replaces lat/lon, and allele frequency replaces weather variabl
 ## IceChunk Zarr Schema (per chromosome)
 
 ```
-genomics_repo/           ← IceChunk store on S3 (icechunk-ro bucket, genomics_repo/ prefix)
+genomics_repo/           ← IceChunk store on S3 (<your-bucket>, <prefix>/genomics_repo/ prefix)
   chr22/
     position      (int32,   n_variants)  ← sorted VCF POS — coordinate axis
     allele_freq   (float32, n_variants)  ← fraction with ALT allele — main data variable
@@ -64,7 +64,7 @@ FastAPI  ·  port 8080  ·  gragen-service
   │  /seed_genomics          → trigger VCF → IceChunk ingest
   │  /meta                   → store info (chromosomes, sample count, snapshots)
   ↓
-IceChunk on S3:  s3://icechunk-ro/genomics_repo/   (SAME bucket as weather project)
+IceChunk on S3:  s3://<your-bucket>/<prefix>/genomics_repo/   (your bucket, namespaced by DEPLOY_PREFIX)
   + Public S3:   s3://1000genomes-dragen/           (VCF source during ingest)
 
 Snowflake:
@@ -81,10 +81,27 @@ Snowflake:
 ## Prerequisites
 
 - `snow` CLI authenticated: `snow connection test -c <CONNECTION>`
+- **The connection's Snowflake credential must allow multi-role access including ACCOUNTADMIN.**
+  If using a programmatic access token (PAT), create it with **multiple roles** (not bound to a
+  single restricted role) and a role of ACCOUNTADMIN — a single-role/restricted PAT blocks
+  `USE ROLE` and lacks privileges to create EAIs / the external volume. (Setup runs as the
+  connection's role and no longer issues `USE ROLE`, so the connection itself must be ACCOUNTADMIN.)
 - Docker with `buildx`
 - SYSADMIN + ACCOUNTADMIN on target Snowflake account
-- **Weather IceChunk project already deployed** (reuses `icechunk-ro` S3 bucket +
-  `ICECHUNK_AWS_KEY_ID` / `ICECHUNK_AWS_SECRET_KEY` Snowflake secrets)
+- **AWS CLI authenticated** against the (shared) AWS account — env vars / SSO / profile —
+  with permission to create an S3 bucket + IAM user/role. `provision_aws.sh` uses these.
+- **Bucket region MUST match the Snowflake account region** (`SELECT CURRENT_REGION();`).
+  A cross-region bucket makes the variant Zarr ingest 5-10x slower (every IceChunk write
+  crosses regions). SFSEHOL accounts are `us-west-2`, so create the bucket in `us-west-2`.
+- A filled-in `config.env` (copy from `config.env.example`): just `GRAGEN_CONNECTION`,
+  `DEPLOY_PREFIX`, `S3_BUCKET`, `AWS_REGION`. The AWS key/secret + `ICEBERG_ROLE_ARN` are
+  **auto-filled by `provision_aws.sh`**. Self-contained — no dependency on the weather project.
+
+> **Multiple SEs, shared AWS account:** each SE has their own Snowflake account but shares one
+> AWS account. A unique `DEPLOY_PREFIX` namespaces the shared resources — S3 paths
+> (`<bucket>/<prefix>/...`) and IAM identities (`<prefix>_gragen_zarr_user` /
+> `<prefix>_gragen_iceberg_role`). One shared bucket; each user's IAM is scoped to their own
+> `<prefix>/*`. Snowflake objects are NOT prefixed (already isolated by separate accounts).
 
 ---
 
@@ -92,9 +109,11 @@ Snowflake:
 
 | Parameter | Example |
 |-----------|---------|
-| `<CONNECTION>` | `internal-marketplace` |
+| `<CONNECTION>` | `internal-marketplace` (set as `GRAGEN_CONNECTION` in config.env) |
 | `<REGISTRY>` | `<account>.registry.snowflakecomputing.com/gragen_db/gragen/gragen_repo` |
-| S3 bucket | `icechunk-ro` (shared with weather project, prefix `genomics_repo/`) |
+| `DEPLOY_PREFIX` | `fsi_london` (lowercase `^[a-z0-9_]+$`; namespaces all storage) |
+| S3 bucket | your own `<S3_BUCKET>`; paths `s3://<bucket>/<prefix>/{genomics_repo,clinvar_repo,iceberg}/` |
+| Iceberg auth | IAM role `ICEBERG_ROLE_ARN` (external volume); Zarr uses AWS access-key secrets |
 | Public source | `s3://1000genomes-dragen` (no credentials needed) |
 
 ---
@@ -114,37 +133,39 @@ This skill **is** the deployment playbook. To hand the full build to someone els
 Cortex Code (publishes it as a Cortex Extension); recipients install it from the catalog
 with `/find-skill`.
 
-**3. Prerequisites the operator needs** (see Prerequisites above): `snow` CLI connection
-(`internal-marketplace`), Docker with `buildx`, the weather IceChunk project already
-deployed (reuses the `icechunk-ro` S3 bucket + `ICECHUNK_DB.ICECHUNK.AWS_ACCESS_KEY_ID` /
-`AWS_SECRET_ACCESS_KEY` secrets).
+**3. Prerequisites the operator needs** (see Prerequisites above): `snow` CLI connection,
+Docker with `buildx`, their own S3 bucket, an IAM role for the external volume, an AWS access
+key, and a filled-in `config.env`. Self-contained — no other project required.
 
 **4. Invoke the skill and follow it end-to-end.** Ask Cortex Code to *"deploy the GRAGEN
 accelerator"* (this skill loads) and it walks through Steps 0–9 + the annotation tables +
 the genome-wide ingest. In short, the operator runs:
 
 ```bash
-snow sql -f sql/01_setup.sql -c internal-marketplace                 # DB, pool, EAIs, role
-snow spcs image-registry login -c internal-marketplace
-bash deploy.sh                                                       # build+push+deploy both images
-snow sql -f sql/02_external_functions.sql -c internal-marketplace    # ext fns + GENOMICS_AGENT + tools
-# seed chr22 variants + ClinVar (Steps 3–4), then load annotation + pedigree tables:
-python3 app/build_clinvar_iceberg.py     # + COPY INTO CHR22_CLINVAR
-python3 app/build_gwas_iceberg.py        # + COPY INTO CHR22_GWAS
-snow sql -f app/build_sfari_iceberg.sql  -c internal-marketplace
-python3 app/build_pedigree_iceberg.py && snow sql -f app/build_pedigree_iceberg.sql -c internal-marketplace
+cp config.env.example config.env                                    # edit prefix/bucket/creds/role
+bash setup.sh                                                       # renders SQL, creates volume + secrets
+# → add the printed STORAGE_AWS_IAM_USER_ARN + EXTERNAL_ID to ICEBERG_ROLE_ARN's trust policy
+snow spcs image-registry login -c "$GRAGEN_CONNECTION"
+bash deploy.sh                                                      # build+push+deploy both images
+snow sql -f sql/02_external_functions.sql -c "$GRAGEN_CONNECTION"   # ext fns + GENOMICS_AGENT + tools
+snow sql -f sql/04_annotation_tables.sql  -c "$GRAGEN_CONNECTION"   # CHR22_CLINVAR + CHR22_GWAS DDL
+# seed chr22 variants + ClinVar (Steps 3–4), then load annotation + pedigree rows:
+python3 app/build_clinvar_iceberg.py     # + PUT/COPY INTO CHR22_CLINVAR
+python3 app/build_gwas_iceberg.py        # + PUT/COPY INTO CHR22_GWAS
+snow sql -f app/build_sfari_iceberg.sql  -c "$GRAGEN_CONNECTION"
+python3 app/build_pedigree_iceberg.py && snow sql -f app/build_pedigree_iceberg.sql -c "$GRAGEN_CONNECTION"
 ```
 
 **5. Re-apply grants** after any service/agent recreate (see Critical Rules #6, #8–11):
 endpoint grants to `PUBLIC`, `SELECT` on Iceberg tables to `PUBLIC`/`GRAGEN_DB_ROLE`, and
-`USAGE` on the agent + tool procedures to `GRAGEN_DB`, `GRAGEN_DB_ROLE`, `SYSADMIN`, `ICECHUNK_DB`.
+`USAGE` on the agent + tool procedures to `GRAGEN_DB`, `GRAGEN_DB_ROLE`, `SYSADMIN`.
 
 ---
 
 ## Workflow
 
 ```
-Step 0: Snowflake setup (DB, pool, EAIs, role/user — reuse S3 bucket/secrets)
+Step 0: Configure (config.env) + Snowflake setup (setup.sh: DB, pool, EAIs, secrets, external volume) + IAM trust
     ↓
 Step 1: Build & push Docker images
     ↓
@@ -163,15 +184,27 @@ Step 7: (Optional) Seed more chromosomes / load SAMPLE_METRICS
 
 ---
 
-### Step 0: Snowflake Setup
+### Step 0: Configure + AWS provision + Snowflake Setup
 
 ```bash
-snow sql -f sql/01_setup.sql -c <CONNECTION>
+cp config.env.example config.env     # edit DEPLOY_PREFIX, S3_BUCKET, AWS_REGION, GRAGEN_CONNECTION
+bash provision_aws.sh                # shared bucket (if missing) + <prefix>_gragen_zarr_user / _iceberg_role
+                                     #   -> writes the IAM-user key + ICEBERG_ROLE_ARN into config.env
+bash setup.sh                        # renders sql/*.tmpl, creates DB/pool/EAIs/secrets + GENOMICS_ICEBERG_VOLUME
+bash provision_aws.sh --trust        # set the IAM role trust policy from the volume's DESC
 ```
 
-**Key note**: Uses the same `icechunk-ro` S3 bucket and `ICECHUNK_AWS_KEY_ID` / 
-`ICECHUNK_AWS_SECRET_KEY` secrets from the weather project. The genomics Zarr store 
-writes to prefix `genomics_repo/` in the same bucket. No new IAM user or S3 bucket needed.
+`provision_aws.sh` uses your ambient AWS CLI credentials (env / SSO / profile; or a gitignored
+`aws_temp.env` if present). `setup.sh` creates the external volume; `--trust` then reads
+`DESC EXTERNAL VOLUME GENOMICS_ICEBERG_VOLUME` for `STORAGE_AWS_IAM_USER_ARN` +
+`STORAGE_AWS_EXTERNAL_ID` and applies them to the role's trust policy automatically (the
+chicken-and-egg step). Do this before loading any annotation tables.
+
+**Key note**: All storage is namespaced under your `DEPLOY_PREFIX` inside the shared bucket:
+Zarr at `s3://<bucket>/<prefix>/{genomics_repo,clinvar_repo}/`, Iceberg at
+`s3://<bucket>/<prefix>/iceberg/`. AWS access-key secrets `GRAGEN_DB.GRAGEN.AWS_ACCESS_KEY_ID`
+/ `AWS_SECRET_ACCESS_KEY` are created by `setup.sh` (used by the IceChunk client). The
+external volume authenticates separately via the IAM role.
 
 ---
 
@@ -206,7 +239,7 @@ ALTER SERVICE GRAGEN_DB.GRAGEN.GRAGEN_ACCELERATOR_SERVICE
 **Re-apply endpoint grants** (needed after any service update):
 ```sql
 GRANT SERVICE ROLE GRAGEN_DB.GRAGEN.GRAGEN_ACCELERATOR_SERVICE!ALL_ENDPOINTS_USAGE TO ROLE PUBLIC;
-GRANT SERVICE ROLE GRAGEN_DB.GRAGEN.GRAGEN_ACCELERATOR_SERVICE!ALL_ENDPOINTS_USAGE TO ROLE ICECHUNK_DB;
+GRANT SERVICE ROLE GRAGEN_DB.GRAGEN.GRAGEN_ACCELERATOR_SERVICE!ALL_ENDPOINTS_USAGE TO ROLE GRAGEN_DB;
 GRANT SERVICE ROLE GRAGEN_DB.GRAGEN.GRAGEN_ACCELERATOR_SERVICE!ALL_ENDPOINTS_USAGE TO ROLE SYSADMIN;
 ```
 ```
@@ -248,7 +281,7 @@ curl -X POST https://<URL>/api/direct/seed_clinvar \
 1. pysam reads ClinVar VCF.gz directly from NCBI FTP via HTTPS range request
 2. Encodes clinical significance: 0=Benign → 4=Pathogenic (+ review confidence)
 3. Writes 1D arrays per chromosome: `position`, `clinsig`, `revstat`, `allele_id`
-4. Commits snapshot to `s3://icechunk-ro/clinvar_repo/`
+4. Commits snapshot to `s3://<your-bucket>/<prefix>/clinvar_repo/`
 
 **Time:** ~4–8 minutes (chr22: ~200K ClinVar variants)
 
@@ -421,8 +454,8 @@ The agent uses `type: generic` tools backed by Python stored procedures (warehou
 
 > **Gotcha:** Snowpark `Row` → use `row.as_dict()`, not `dict(row)` (else "dictionary update
 > sequence element"). `CREATE OR REPLACE AGENT` **drops all grants** — re-grant `USAGE ON AGENT`
-> + every tool procedure to `GRAGEN_DB`, `GRAGEN_DB_ROLE`, `SYSADMIN`, **and `ICECHUNK_DB`**
-> (the frontend service identity), or the agent API returns 401.
+>           + every tool procedure to `GRAGEN_DB`, `GRAGEN_DB_ROLE`, `SYSADMIN` (the frontend
+> service identity), or the agent API returns 401.
 
 ### Origins globe + theme
 
@@ -440,7 +473,7 @@ The agent uses `type: generic` tools backed by Python stored procedures (warehou
    - `clinvar_repo/` (ClinVar annotations) → seed via `POST /api/direct/seed_clinvar`
    - `/meta` and `/meta/clinvar` show which chromosomes are available.
 
-2. **Reuses weather project's S3 bucket** — prefixes are `genomics_repo/` and `clinvar_repo/`. The `AWS_ACCESS_KEY_ID` secret must have write access to `icechunk-ro`.
+2. **Bring your own bucket + unique prefix** — Zarr prefixes are `<prefix>/genomics_repo/` and `<prefix>/clinvar_repo/` inside your `S3_BUCKET`. The `GRAGEN_DB.GRAGEN.AWS_ACCESS_KEY_ID` secret must have read/write on `s3://<S3_BUCKET>/<prefix>/*`. Set in `config.env`; created by `setup.sh`.
 
 3. **VCF ingestion uses boto3/urllib HTTP range requests via TBI index** (NOT pysam):
    - pysam/libcurl does NOT route through SPCS's EAI proxy — causes silent hangs
@@ -468,14 +501,14 @@ The agent uses `type: generic` tools backed by Python stored procedures (warehou
        env:
          SEED_TYPE: genomics
          SEED_CHROMS: chr22
-         ICECHUNK_BUCKET: icechunk-ro
-         ICECHUNK_GENOMICS_PREFIX: genomics_repo
-         AWS_DEFAULT_REGION: us-west-2
+         ICECHUNK_BUCKET: <your-bucket>
+         ICECHUNK_GENOMICS_PREFIX: <prefix>/genomics_repo
+         AWS_DEFAULT_REGION: <your-region>
          INGEST_WORKERS: "8"
        secrets:
-       - snowflakeSecret: ICECHUNK_DB.ICECHUNK.AWS_ACCESS_KEY_ID
+       - snowflakeSecret: GRAGEN_DB.GRAGEN.AWS_ACCESS_KEY_ID
          envVarName: AWS_ACCESS_KEY_ID
-       - snowflakeSecret: ICECHUNK_DB.ICECHUNK.AWS_SECRET_ACCESS_KEY
+       - snowflakeSecret: GRAGEN_DB.GRAGEN.AWS_SECRET_ACCESS_KEY
          envVarName: AWS_SECRET_ACCESS_KEY
    $$;
 
@@ -493,7 +526,7 @@ The agent uses `type: generic` tools backed by Python stored procedures (warehou
 6. **GRANT SERVICE ROLE required after every ALTER SERVICE** — SPCS drops endpoint grants when the service spec is updated. Always re-run:
    ```sql
    GRANT SERVICE ROLE GRAGEN_DB.GRAGEN.GRAGEN_ACCELERATOR_SERVICE!ALL_ENDPOINTS_USAGE TO ROLE PUBLIC;
-   GRANT SERVICE ROLE GRAGEN_DB.GRAGEN.GRAGEN_ACCELERATOR_SERVICE!ALL_ENDPOINTS_USAGE TO ROLE ICECHUNK_DB;
+   GRANT SERVICE ROLE GRAGEN_DB.GRAGEN.GRAGEN_ACCELERATOR_SERVICE!ALL_ENDPOINTS_USAGE TO ROLE GRAGEN_DB;
    ```
 
 7. **chr22 first** — smallest autosome, validates the full pipeline in ~15 minutes total.
@@ -501,14 +534,14 @@ The agent uses `type: generic` tools backed by Python stored procedures (warehou
 8. **Backend `ALTER SERVICE` spec MUST carry the full env + secrets + both EAIs.**
    `ALTER SERVICE … FROM SPECIFICATION` **replaces** the entire spec — any omitted
    `secrets:` / `env:` block is dropped, silently removing S3 credentials. The
-   `gragen-service` spec (in `deploy.sh` and `sql/03_deploy_services.sql`) must always include:
+   `gragen-service` spec (in `deploy.sh` and `sql/03_deploy_services.sql.tmpl`) must always include:
    ```yaml
-   env: { PYTHONUNBUFFERED: "1", ICECHUNK_BUCKET: icechunk-ro,
-          ICECHUNK_GENOMICS_PREFIX: genomics_repo, ICECHUNK_CLINVAR_PREFIX: clinvar_repo,
-          AWS_DEFAULT_REGION: us-west-2, INGEST_WORKERS: "16" }
+   env: { PYTHONUNBUFFERED: "1", ICECHUNK_BUCKET: <your-bucket>,
+          ICECHUNK_GENOMICS_PREFIX: <prefix>/genomics_repo, ICECHUNK_CLINVAR_PREFIX: <prefix>/clinvar_repo,
+          AWS_DEFAULT_REGION: <your-region>, INGEST_WORKERS: "16" }
    secrets:
-   - { snowflakeSecret: { objectName: ICECHUNK_DB.ICECHUNK.ICECHUNK_AWS_KEY_ID }, envVarName: AWS_ACCESS_KEY_ID }
-   - { snowflakeSecret: { objectName: ICECHUNK_DB.ICECHUNK.ICECHUNK_AWS_SECRET_KEY }, envVarName: AWS_SECRET_ACCESS_KEY }
+   - { snowflakeSecret: { objectName: GRAGEN_DB.GRAGEN.AWS_ACCESS_KEY_ID }, envVarName: AWS_ACCESS_KEY_ID }
+   - { snowflakeSecret: { objectName: GRAGEN_DB.GRAGEN.AWS_SECRET_ACCESS_KEY }, envVarName: AWS_SECRET_ACCESS_KEY }
    ```
    then `SET EXTERNAL_ACCESS_INTEGRATIONS = (ICECHUNK_S3_EAI, GENOMICS_1000G_EAI);`
    Symptom of a stripped spec: backend 503 / IceChunk repo not found after a backend deploy.
@@ -539,6 +572,8 @@ The agent uses `type: generic` tools backed by Python stored procedures (warehou
 
 | Version | Date | Notes |
 |---------|------|-------|
+| v1.0.32 | 2026-06-09 | **Multi-SE shared-AWS provisioning.** Committed `provision_aws.sh` (prefix-parameterized): one shared S3 bucket + per-`DEPLOY_PREFIX` IAM user (`<prefix>_gragen_zarr_user`, scoped to `<prefix>/*`) + role (`<prefix>_gragen_iceberg_role`); auto-fills the AWS key/secret + `ICEBERG_ROLE_ARN` into `config.env` (secret never echoed); `--trust` phase reads the external-volume `DESC` and sets the role trust policy automatically. Model: each SE has their own Snowflake account (no Snowflake-object prefixing) but shares one AWS account (prefix isolates S3 + IAM). |
+| v1.0.31 | 2026-06-09 | **Self-contained / bring-your-own-bucket.** New `config.env` + `setup.sh` (python-rendered SQL templates) let a deployer supply their own `S3_BUCKET` + unique `DEPLOY_PREFIX` that namespaces all storage (`<prefix>/genomics_repo`, `/clinvar_repo`, `/iceberg`). `setup.sh` now **creates `GENOMICS_ICEBERG_VOLUME`** (previously never created) via `STORAGE_AWS_ROLE_ARN` + prints the IAM trust-policy gate. Secrets moved to self-contained `GRAGEN_DB.GRAGEN.AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (dropped `ICECHUNK_DB` dependency + naming bug). Added `sql/04_annotation_tables.sql` (CLINVAR/GWAS DDL + load stage). SQL files are now `.sql.tmpl`. |
 | v1.0.30 | 2026-06-09 | Trio family links (clickable father/mother in sample panel) from new `SAMPLE_PEDIGREE` Iceberg table (1000G 3,202 pedigree). Gosling tracks now fill the viewport height. Agent gains `tool_pedigree` (father/mother/children). |
 | v1.0.29 | 2026-06-09 | Dark Snowflake "module" restyle: ICECHUNK palette (`#0D1117/#161B22/#2D3F53`, accent `#29B5E8`), branded sidebar + grouped nav + app-header + panels (`src/index.css`, `GenomicsViewer.tsx`). Viz canvases stay near-black. |
 | v1.0.28 | 2026-06-09 | Origins globe rebuilt with react-three-fiber + bundled Earth texture (deck.gl `_GlobeView` rendered blank). Annotation auto-navigation for sparse GWAS/SFARI sources (`goToRegion`). Fixed "annotations always 0" (GRANT SELECT on Iceberg tables to PUBLIC). Added `tool_query_annotations` to GENOMICS_AGENT; fixed `dict(row)`→`as_dict()` in all agent tools; re-granted agent USAGE after recreate. |

@@ -38,9 +38,14 @@ Express · port 3001 · gragen-accelerator service
   ↓
 FastAPI · port 8080 · gragen-service
   ↓
-┌─ IceChunk Zarr on S3 (s3://icechunk-ro/genomics_repo/, clinvar_repo/) ─ cohort variants (huge, numeric)
-└─ Snowflake Iceberg (GENOMICS_ICEBERG_VOLUME) ───────────────────────── annotations (small, categorical)
+┌─ IceChunk Zarr on S3 (s3://<your-bucket>/<prefix>/genomics_repo/, clinvar_repo/) ─ cohort variants (huge)
+└─ Snowflake Iceberg (GENOMICS_ICEBERG_VOLUME @ <your-bucket>/<prefix>/iceberg/) ─ annotations (categorical)
 ```
+
+**Bring your own storage.** A deployment supplies its own S3 bucket and a unique
+`DEPLOY_PREFIX` (set in `config.env`). Every path is namespaced under that prefix, so any
+number of accounts can deploy into one or many buckets without colliding:
+`s3://<bucket>/<prefix>/{genomics_repo,clinvar_repo,iceberg}/`.
 
 | Data | Store | Why |
 |------|-------|-----|
@@ -64,7 +69,13 @@ FastAPI · port 8080 · gragen-service
 │   └── seed_job.py           EXECUTE JOB SERVICE entrypoint
 ├── gragen-accelerator/       React + Vite frontend
 │   └── src/components/        DNAHelix.tsx, GenomicsViewer.tsx, …
-├── sql/                      01_setup, 02_external_functions, 03_deploy_services
+├── sql/                      01_setup.sql.tmpl, 02_external_functions.sql,
+│                             03_deploy_services.sql.tmpl, 04_annotation_tables.sql,
+│                             run_genome_ingest_job.sql.tmpl  (.tmpl → rendered by setup.sh)
+├── config.env.example        deployer inputs: bucket, prefix, region, creds, IAM role ARN
+├── setup.sh                  one-time Snowflake setup (renders SQL, creates volume + secrets)
+├── provision_aws.sh          one-time AWS setup (shared bucket + per-prefix IAM user/role)
+├── config.env.example        deployer inputs: prefix, bucket, region (creds auto-filled)
 ├── Dockerfile · deploy.sh · VERSION · GENOMICS_SV.yaml
 ├── AGENT.md                  Operational guide for Cortex Code (CoCo)
 └── .cortex/skills/gragen-accelerator/SKILL.md   Full step-by-step deployment playbook
@@ -72,28 +83,59 @@ FastAPI · port 8080 · gragen-service
 
 ---
 
+## Multiple SEs on a shared AWS account
+
+Each SE has their **own Snowflake account** but everyone **shares one AWS account**. A unique
+`DEPLOY_PREFIX` (you pick it in `config.env`) namespaces everything that's shared:
+
+- S3 paths: `s3://<bucket>/<prefix>/{genomics_repo,clinvar_repo,iceberg}/` (one shared bucket)
+- IAM user: `<prefix>_gragen_zarr_user` — scoped to `s3://<bucket>/<prefix>/*` only
+- IAM role: `<prefix>_gragen_iceberg_role` — for the Iceberg external volume
+
+Snowflake objects (`GRAGEN_DB`, `GENOMICS_ICEBERG_VOLUME`, the agent, …) are **not** prefixed —
+they're already isolated by living in your own Snowflake account. So two SEs just pick two
+different prefixes and never collide. `provision_aws.sh` creates the shared bucket only if it's
+missing and reuses it otherwise.
+
+---
+
 ## Quick start
 
-> Prerequisites: `snow` CLI authenticated, Docker with `buildx`, the weather IceChunk
-> project already deployed (reuses the `icechunk-ro` S3 bucket + AWS secrets in
-> `ICECHUNK_DB.ICECHUNK`). Full detail is in the skill.
+> Prerequisites: `snow` CLI authenticated to your own Snowflake account with a credential that
+> allows **multi-role access including ACCOUNTADMIN** (a single-role/restricted PAT blocks
+> `USE ROLE` and can't create EAIs / the external volume), Docker with `buildx`, and AWS CLI
+> authenticated against the shared AWS account (env vars / SSO / profile) with permission to
+> create an S3 bucket + IAM user/role. Full detail is in the skill.
 
 ```bash
-# 1. Snowflake setup (DB, compute pool, EAIs, role/user)
-snow sql -f sql/01_setup.sql -c internal-marketplace
+# 0. Configure: pick a unique prefix + the shared bucket/region (creds auto-filled later)
+cp config.env.example config.env        # edit DEPLOY_PREFIX, S3_BUCKET, AWS_REGION, GRAGEN_CONNECTION
 
-# 2. Build + push images, deploy both SPCS services
-snow spcs image-registry login -c internal-marketplace
-bash deploy.sh                       # prints the live app URL
+# 1. Provision AWS (shared bucket + your prefixed IAM user/role). Writes the IAM-user
+#    key + ICEBERG_ROLE_ARN back into config.env automatically.
+bash provision_aws.sh
 
-# 3. Seed chr22 variants + ClinVar into IceChunk (via the app, see SKILL.md Step 3–4)
-# 4. External functions + Cortex Agent
-snow sql -f sql/02_external_functions.sql -c internal-marketplace
+# 2. One-time Snowflake setup: renders SQL, creates DB/pool/EAIs/secrets +
+#    GENOMICS_ICEBERG_VOLUME (prints the IAM trust-policy details).
+bash setup.sh
 
-# 5. Load genome-wide annotation tables (Iceberg)
-python3 app/build_clinvar_iceberg.py    # then COPY INTO CHR22_CLINVAR
-python3 app/build_gwas_iceberg.py       # then COPY INTO CHR22_GWAS
-snow sql -f app/build_sfari_iceberg.sql -c internal-marketplace
+# 3. Finalize the IAM role trust policy from the volume's DESC (closes the loop).
+bash provision_aws.sh --trust
+
+# 4. Build + push images, deploy both SPCS services
+snow spcs image-registry login -c "$GRAGEN_CONNECTION"
+bash deploy.sh                          # prints the live app URL
+
+# 5. Seed chr22 variants + ClinVar into IceChunk (via the app, see SKILL.md Step 3–4)
+# 6. External functions + Cortex Agent
+snow sql -f sql/02_external_functions.sql -c "$GRAGEN_CONNECTION"
+
+# 7. Load genome-wide annotation tables (Iceberg)
+snow sql -f sql/04_annotation_tables.sql -c "$GRAGEN_CONNECTION"   # creates CHR22_CLINVAR + CHR22_GWAS
+python3 app/build_clinvar_iceberg.py    # then PUT + COPY INTO CHR22_CLINVAR
+python3 app/build_gwas_iceberg.py       # then PUT + COPY INTO CHR22_GWAS
+snow sql -f app/build_sfari_iceberg.sql -c "$GRAGEN_CONNECTION"
+python3 app/build_pedigree_iceberg.py && snow sql -f app/build_pedigree_iceberg.sql -c "$GRAGEN_CONNECTION"
 ```
 
 ### Redeploy after code changes
@@ -119,25 +161,31 @@ can reproduce the entire accelerator end-to-end.
    `~/.snowflake/cortex/plugins/gragen-accelerator/`.
 2. **Share it (optional)** — run `/share-skill` in Cortex Code to publish it as a Cortex
    Extension to other users in the account; they install it via `/find-skill`.
-3. **Prereqs** — `snow` CLI connection (`internal-marketplace`), Docker `buildx`, and the
-   weather IceChunk project deployed (reuses the `icechunk-ro` bucket + AWS secrets).
-4. **Run it** — ask Cortex Code to *"deploy the GRAGEN accelerator"*; the skill loads and
-   walks Steps 0–9 (setup → images → services → seed variants/ClinVar → external functions +
-   `GENOMICS_AGENT` + tools → annotation/pedigree tables → verify). Condensed:
+3. **Prereqs** — `snow` CLI connection (ACCOUNTADMIN) to your own Snowflake account, Docker
+   `buildx`, and AWS CLI authenticated against the shared AWS account (permission to create an
+   S3 bucket + IAM user/role). Self-contained — no other project required.
+4. **Run it** — fill in `config.env` (just prefix/bucket/region), then ask Cortex Code to
+   *"deploy the GRAGEN accelerator"*; the skill loads and walks Steps 0–9 (config → AWS
+   provision → setup → IAM trust → images → services → seed variants/ClinVar → external
+   functions + `GENOMICS_AGENT` + tools → annotation/pedigree tables → verify). Condensed:
 
    ```bash
-   snow sql -f sql/01_setup.sql -c internal-marketplace
-   snow spcs image-registry login -c internal-marketplace
+   cp config.env.example config.env         # edit DEPLOY_PREFIX, S3_BUCKET, AWS_REGION, GRAGEN_CONNECTION
+   bash provision_aws.sh                    # shared bucket + prefixed IAM user/role; fills creds in config.env
+   bash setup.sh                            # creates volume + secrets, prints IAM trust info
+   bash provision_aws.sh --trust            # set role trust from the volume DESC
+   snow spcs image-registry login -c "$GRAGEN_CONNECTION"
    bash deploy.sh
-   snow sql -f sql/02_external_functions.sql -c internal-marketplace
-   python3 app/build_clinvar_iceberg.py     # + COPY INTO CHR22_CLINVAR
-   python3 app/build_gwas_iceberg.py        # + COPY INTO CHR22_GWAS
-   snow sql -f app/build_sfari_iceberg.sql  -c internal-marketplace
-   python3 app/build_pedigree_iceberg.py && snow sql -f app/build_pedigree_iceberg.sql -c internal-marketplace
+   snow sql -f sql/02_external_functions.sql -c "$GRAGEN_CONNECTION"
+   snow sql -f sql/04_annotation_tables.sql -c "$GRAGEN_CONNECTION"
+   python3 app/build_clinvar_iceberg.py     # + PUT/COPY INTO CHR22_CLINVAR
+   python3 app/build_gwas_iceberg.py        # + PUT/COPY INTO CHR22_GWAS
+   snow sql -f app/build_sfari_iceberg.sql  -c "$GRAGEN_CONNECTION"
+   python3 app/build_pedigree_iceberg.py && snow sql -f app/build_pedigree_iceberg.sql -c "$GRAGEN_CONNECTION"
    ```
 5. **Re-apply grants** after any service/agent recreate (the skill's Critical Rules cover
-   this): endpoint grants → `PUBLIC`; `SELECT` on Iceberg tables → `PUBLIC`/`GRAGEN_DB_ROLE`;
-   `USAGE` on the agent + tool procedures → `GRAGEN_DB`, `GRAGEN_DB_ROLE`, `SYSADMIN`, `ICECHUNK_DB`.
+   this): endpoint grants → `PUBLIC`; `SELECT` on Iceberg tables → `PUBLIC`/`GRAGEN_DB`;
+   `USAGE` on the agent + tool procedures → `GRAGEN_DB`, `SYSADMIN`.
 
 ---
 

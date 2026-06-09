@@ -1,22 +1,18 @@
 -- =============================================================================
--- GRAGEN Genomics Accelerator — Snowflake Setup  v1.0.1
+-- GRAGEN Genomics Accelerator — Snowflake Setup  (TEMPLATE)
 -- =============================================================================
--- Run as SYSADMIN / ACCOUNTADMIN.
--- NOTE: Reuses the existing icechunk-ro S3 bucket and AWS secrets from the
---       weather (IceChunk) project. No new S3 bucket or IAM user needed.
---       The genomics IceChunk store is written to prefix "genomics_repo/"
---       in the same bucket.
+-- DO NOT run this .tmpl directly. It is rendered by setup.sh (envsubst) into
+-- sql/_rendered/01_setup.sql with your config.env values, then executed.
 --
--- Usage:
---   snow sql -f sql/01_setup.sql -c <CONNECTION>
+-- Bring-your-own-bucket: all storage is namespaced under a unique prefix:
+--   s3://${S3_BUCKET}/${DEPLOY_PREFIX}/genomics_repo/   IceChunk Zarr (variants)
+--   s3://${S3_BUCKET}/${DEPLOY_PREFIX}/clinvar_repo/    IceChunk Zarr (ClinVar)
+--   s3://${S3_BUCKET}/${DEPLOY_PREFIX}/iceberg/         Iceberg external volume
 --
--- Prerequisites (already exist from weather project):
---   - S3 bucket: icechunk-ro
---   - Snowflake secrets: ICECHUNK_AWS_KEY_ID, ICECHUNK_AWS_SECRET_KEY
---   - EAI: ICECHUNK_S3_EAI (for private S3 read/write)
+-- Run with a connection whose role is ACCOUNTADMIN (needed for EAIs + external
+-- volume). No USE ROLE here so this also works in PAT-restricted sessions
+-- (workshop accounts) where USE ROLE is blocked. Secrets created by setup.sh.
 -- =============================================================================
-
-USE ROLE SYSADMIN;
 
 -- ── Database + schema ─────────────────────────────────────────────────────────
 CREATE DATABASE IF NOT EXISTS GRAGEN_DB;
@@ -42,28 +38,36 @@ CREATE COMPUTE POOL IF NOT EXISTS GRAGEN_COMPUTE_POOL
   AUTO_SUSPEND_SECS = 300
   COMMENT = 'GRAGEN Genomics Accelerator compute pool';
 
--- ── External Access Integrations ──────────────────────────────────────────────
-USE ROLE ACCOUNTADMIN;
+-- Larger pool for the genome-wide variant ingest job (EXECUTE JOB SERVICE).
+-- Single big node; auto-suspends quickly when the job finishes.
+CREATE COMPUTE POOL IF NOT EXISTS GRAGEN_INGEST_POOL
+  MIN_NODES = 1
+  MAX_NODES = 1
+  INSTANCE_FAMILY = CPU_X64_L
+  AUTO_RESUME = TRUE
+  AUTO_SUSPEND_SECS = 60
+  COMMENT = 'GRAGEN variant ingest pool (VCF -> IceChunk Zarr)';
 
--- EAI 1: Private S3 bucket (icechunk-ro) — for reading/writing the IceChunk
---         genomics Zarr store. REUSES the same bucket as the weather project.
---         If ICECHUNK_S3_EAI already exists, skip this block.
+-- ── External Access Integrations ──────────────────────────────────────────────
+-- (EAIs require the connection role to be ACCOUNTADMIN)
+
+-- EAI 1: Your private S3 bucket — for reading/writing the IceChunk Zarr stores.
 CREATE OR REPLACE NETWORK RULE ICECHUNK_S3_NETWORK_RULE
   TYPE = HOST_PORT
   MODE = EGRESS
   VALUE_LIST = (
     's3.amazonaws.com',
-    's3.us-west-2.amazonaws.com',
-    'icechunk-ro.s3.amazonaws.com',
-    'icechunk-ro.s3.us-west-2.amazonaws.com'
+    's3.${AWS_REGION}.amazonaws.com',
+    '${S3_BUCKET}.s3.amazonaws.com',
+    '${S3_BUCKET}.s3.${AWS_REGION}.amazonaws.com'
   );
 
 CREATE OR REPLACE EXTERNAL ACCESS INTEGRATION ICECHUNK_S3_EAI
   ALLOWED_NETWORK_RULES = (ICECHUNK_S3_NETWORK_RULE)
-  ALLOWED_AUTHENTICATION_SECRETS = (ICECHUNK_DB.ICECHUNK.ICECHUNK_AWS_KEY_ID,
-                                    ICECHUNK_DB.ICECHUNK.ICECHUNK_AWS_SECRET_KEY)
+  ALLOWED_AUTHENTICATION_SECRETS = (GRAGEN_DB.GRAGEN.AWS_ACCESS_KEY_ID,
+                                    GRAGEN_DB.GRAGEN.AWS_SECRET_ACCESS_KEY)
   ENABLED = TRUE
-  COMMENT = 'Private S3 access for IceChunk store (shared with weather project)';
+  COMMENT = 'Private S3 access for the IceChunk Zarr stores';
 
 -- EAI 2: Public 1000 Genomes S3 bucket — for ingesting VCF files and reading
 --         sample metadata. Public bucket: no credentials needed, but SPCS still
@@ -93,25 +97,31 @@ CREATE OR REPLACE EXTERNAL ACCESS INTEGRATION GRAGEN_MAP_TILES_EAI
   ALLOWED_NETWORK_RULES = (CARTO_TILES_NETWORK_RULE)
   ENABLED = TRUE;
 
-USE ROLE SYSADMIN;
+-- ── Iceberg external volume (annotations) ──────────────────────────────────────
+-- Snowflake-managed Iceberg tables (ClinVar / GWAS / SFARI / pedigree) live here.
+-- External volumes authenticate via an IAM role (NOT access keys). After this
+-- runs, setup.sh prints STORAGE_AWS_IAM_USER_ARN + STORAGE_AWS_EXTERNAL_ID —
+-- add those to ${ICEBERG_ROLE_ARN}'s trust policy before loading data.
+CREATE EXTERNAL VOLUME IF NOT EXISTS GENOMICS_ICEBERG_VOLUME
+  STORAGE_LOCATIONS = (
+    (
+      NAME = 'genomics-iceberg'
+      STORAGE_PROVIDER = 'S3'
+      STORAGE_BASE_URL = 's3://${S3_BUCKET}/${DEPLOY_PREFIX}/iceberg/'
+      STORAGE_AWS_ROLE_ARN = '${ICEBERG_ROLE_ARN}'
+    )
+  )
+  ALLOW_WRITES = TRUE
+  COMMENT = 'GRAGEN annotation Iceberg tables (prefix ${DEPLOY_PREFIX})';
 
--- ── AWS credentials (reuse from weather project) ──────────────────────────────
--- The gragen-service container needs the same AWS credentials that the
--- icechunk-service uses to write to the icechunk-ro bucket.
--- If ICECHUNK_AWS_KEY_ID / ICECHUNK_AWS_SECRET_KEY already exist in
--- ICECHUNK_DB.ICECHUNK, grant access to GRAGEN_DB role instead of creating new.
---
--- If this is a fresh account, create new secrets:
--- CREATE SECRET GRAGEN_DB.GRAGEN.AWS_KEY_ID
---   TYPE = GENERIC_STRING
---   SECRET_STRING = '<your-aws-access-key-id>';
--- CREATE SECRET GRAGEN_DB.GRAGEN.AWS_SECRET_KEY
---   TYPE = GENERIC_STRING
---   SECRET_STRING = '<your-aws-secret-access-key>';
+GRANT USAGE ON EXTERNAL VOLUME GENOMICS_ICEBERG_VOLUME TO ROLE SYSADMIN;
+
+-- ── Internal stage for CSV loads (annotation tables) ──────────────────────────
+CREATE STAGE IF NOT EXISTS GRAGEN_DB.GRAGEN.GRAGEN_LOAD_STAGE
+  COMMENT = 'Staging area for annotation CSV loads (ClinVar / GWAS / SFARI / pedigree)';
 
 -- ── Sample QC metrics table ────────────────────────────────────────────────────
 -- Populated by the /seed_genomics endpoint reading CSV files from S3.
--- Equivalent to having weather data pre-loaded for the cohort scatter view.
 CREATE TABLE IF NOT EXISTS GRAGEN_DB.GRAGEN.SAMPLE_METRICS (
   sample_id         VARCHAR(20)    NOT NULL,
   population        VARCHAR(10),
@@ -135,21 +145,8 @@ CREATE TABLE IF NOT EXISTS GRAGEN_DB.GRAGEN.SAMPLE_METRICS (
   PRIMARY KEY (sample_id)
 );
 
-SELECT 'Setup complete. Next steps:
-1. Build and push Docker images:
-   bash deploy.sh --build-only
-2. Deploy SPCS services:
-   bash deploy.sh
-3. Trigger genomics ingest (chr22 first):
-   curl -X POST https://<URL>/api/direct/seed_genomics
-     -H "Content-Type: application/json"
-     -d "{\"chroms\": [\"chr22\"]}"
-4. Create external functions + agent:
-   snow sql -f sql/02_external_functions.sql -c <CONNECTION>
-' AS instructions;
-
 -- =============================================================================
--- Role + User setup (run as SYSADMIN — not ACCOUNTADMIN)
+-- Role + User setup
 -- =============================================================================
 CREATE ROLE IF NOT EXISTS GRAGEN_DB;
 CREATE USER IF NOT EXISTS GRAGEN
@@ -164,9 +161,12 @@ GRANT ALL ON FUTURE TABLES IN SCHEMA GRAGEN_DB.GRAGEN TO ROLE GRAGEN_DB;
 GRANT USAGE ON WAREHOUSE GRAGEN_WH TO ROLE GRAGEN_DB;
 GRANT DATABASE ROLE SNOWFLAKE.CORTEX_USER TO ROLE GRAGEN_DB;
 
+-- External volume usable by the app role (for creating/querying Iceberg tables)
+GRANT USAGE ON EXTERNAL VOLUME GENOMICS_ICEBERG_VOLUME TO ROLE GRAGEN_DB;
+
+SELECT 'Setup complete. See the IAM trust-policy gate printed by setup.sh, then run the loaders + deploy.sh.' AS instructions;
+
 -- Run these AFTER services are deployed:
 -- GRANT USAGE ON SERVICE GRAGEN_DB.GRAGEN.GRAGEN_SERVICE TO ROLE GRAGEN_DB;
 -- GRANT USAGE ON SERVICE GRAGEN_DB.GRAGEN.GRAGEN_ACCELERATOR_SERVICE TO ROLE GRAGEN_DB;
--- GRANT SERVICE ROLE GRAGEN_DB.GRAGEN.GRAGEN_ACCELERATOR_SERVICE!ALL_ENDPOINTS_USAGE TO ROLE GRAGEN_DB;
--- GRANT SERVICE ROLE GRAGEN_DB.GRAGEN.GRAGEN_SERVICE!ALL_ENDPOINTS_USAGE TO ROLE GRAGEN_DB;
 -- GRANT SERVICE ROLE GRAGEN_DB.GRAGEN.GRAGEN_ACCELERATOR_SERVICE!ALL_ENDPOINTS_USAGE TO ROLE PUBLIC;
