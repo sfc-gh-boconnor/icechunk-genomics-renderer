@@ -26,6 +26,55 @@ replaces lat/lon, allele frequency replaces weather variables.
 
 ---
 
+## ISF Solution Profile
+
+> Structured summary for the **Industry Solutions Framework (ISF)** — maps to the ISF Solution Template (positioning, personas, use cases, pain points, demos, accelerators). Onboard via the ISF Creator (`@isf-create.agent.md`, Repository input mode).
+
+**Industry:** Healthcare & Life Sciences (Genomics / Life Sciences)
+**Maturity level:** L2 Validated — live deployable demo + architecture diagram + reusable accelerator.
+**Solution category:** GTM Solution.
+
+### Solution positioning
+GRAGEN is a population-scale genomics data application on Snowflake. It ingests 1000 Genomes DRAGEN variant data into an IceChunk Zarr store on S3, overlays clinical and research annotations from Snowflake Iceberg tables, and surfaces it all through an interactive 3D genome browser, cohort QC dashboards, a family-pedigree globe, and a natural-language Cortex Agent — so genomic data that is far too large for relational tables stays queryable, explorable, and explainable in seconds.
+
+### Value proposition
+- **Query any genomic region in sub-second time** via `np.searchsorted` range-slicing over the IceChunk Zarr store — no full-table scans, no per-chromosome materialization of millions of variant rows.
+- **One store, two tiers:** huge cohort variants live once in IceChunk Zarr; categorical annotations (ClinVar / GWAS / SFARI) live in Snowflake Iceberg and can be added without rebuilding the backend.
+- **Add a chromosome with one click** — an in-app loader triggers an async SPCS job (16 workers) and restarts the backend to re-open the store.
+- **Natural-language genomics** — the Cortex Agent answers cohort and variant questions across 3,202 samples and can drive the UI (jump to a region/gene, filter pathogenic, switch annotation source).
+
+### Business challenges
+Genomic variant volumes overflow relational tables; Annotations are scattered across ClinVar/GWAS/SFARI; Domain experts lack bioinformatics tooling to query data; Cohort QC and ancestry are hard to visualize at scale; Trio/pedigree relationships are hard to interpret
+
+### Target personas
+- **Bioinformatician / Computational Biologist** — needs fast region/variant access and annotation overlays without writing pipeline code.
+- **Genomics Platform / Data Engineer** — needs a scalable store for population-scale variants and a repeatable deployment.
+- **Translational Researcher / Clinical Geneticist** — needs clinical significance and trait associations in context, explained in plain language.
+- **Sales / Solutions Engineer** — needs a deployable, narratable demo of Snowflake for life sciences.
+
+### Use cases
+1. **Population-scale variant & allele-frequency exploration** — range-slice any region/gene across the cohort directly from the IceChunk Zarr store, including on-the-fly cohort allele frequency.
+2. **Cohort QC & ancestry visualization** — coverage, Ti/Tv, het/hom and duplicate rates across 3,202 samples, with populations mapped by superpopulation.
+3. **Clinical & research annotation overlay** — ClinVar (clinical significance), GWAS Catalog (trait associations), and SFARI (autism genes) overlaid on a 3D DNA helix and genome browser.
+4. **Natural-language genomic Q&A** — a Cortex Agent answers questions and drives the UI across the cohort.
+5. **Family / trio pedigree analysis** — a "Family Constellation" view renders all 602 parent–offspring trios, including a geographic globe placing families at their population's real-world origin (5 superpopulations, 26 populations).
+
+### Pain points addressed
+- Variant data (millions of rows per chromosome) is too large and too sparse for relational tables — addressed by never materializing it (IceChunk Zarr, range-sliced).
+- Clinical/research annotations are fragmented across sources — addressed by a swappable Iceberg annotation tier.
+- Non-bioinformaticians can't self-serve genomic questions — addressed by the Cortex Agent.
+- Cohort relationships (trios, ancestry) are hard to grasp from tables — addressed by the 3D cohort and family visualizations.
+
+### Snowflake products & platform capabilities
+Snowpark Container Services (SPCS) · Cortex Agents · Iceberg Tables (external volume on S3) · External / service functions · Cortex Search (entity resolution) · Streamlit-style React frontend on SPCS. **Integrations:** Amazon S3, IceChunk/Zarr, 1000 Genomes DRAGEN, NCBI ClinVar, EBI GWAS Catalog, SFARI Gene.
+
+### Demos & accelerators
+- **Live demo** — the deployed SPCS app (3D helix, cohort QC, genome browser, family globe, agent chat). Requires login.
+- **Solution accelerator (code)** — this repository plus the bundled Cortex Code skill (`.cortex/skills/gragen-accelerator/SKILL.md`) reproduces the entire stack end-to-end (AWS provision → SPCS deploy → seed → agent + annotations).
+- **Architecture diagram** — see *Architecture (two storage tiers)* below.
+
+---
+
 ## Architecture (two storage tiers)
 
 ```
