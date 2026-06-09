@@ -442,8 +442,12 @@ def direct_metrics(sample_id: str):
             parts = [p.strip() for p in line.split(",")]
             if len(parts) < 4:
                 continue
+            # Sample-level aggregate only ("MAPPING/ALIGNING SUMMARY" with empty
+            # read-group); PER RG rows repeat keys per lane and would clobber totals.
+            if parts[0] != "MAPPING/ALIGNING SUMMARY" or parts[1] != "":
+                continue
             key, val = parts[2], parts[3]
-            if key == "Average alignment coverage over genome":
+            if key == "Average sequenced coverage over genome":
                 try: mapping_metrics["mean_coverage"] = float(val)
                 except ValueError: pass
             elif key == "Number of duplicate marked reads":
@@ -470,6 +474,9 @@ def direct_metrics(sample_id: str):
         for line in csv_text.splitlines():
             parts = [p.strip() for p in line.split(",")]
             if len(parts) < 4:
+                continue
+            # Post-filter per-sample variant stats only (not PREFILTER/SUMMARY rows).
+            if parts[0] != "VARIANT CALLER POSTFILTER":
                 continue
             key, val = parts[2], parts[3]
             if key == "SNPs":
