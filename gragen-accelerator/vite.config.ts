@@ -11,5 +11,16 @@ export default defineConfig({
   },
   build: {
     outDir: 'dist',
+    chunkSizeWarningLimit: 3000,
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          'gosling': ['gosling.js'],
+          'three': ['three', '@react-three/fiber', '@react-three/drei'],
+          'deckgl': ['@deck.gl/core', '@deck.gl/layers', '@deck.gl/react', '@deck.gl/widgets'],
+        },
+      },
+    },
   },
 })
+

@@ -22,14 +22,20 @@ export interface SampleMetrics extends Sample {
   error?: string
 }
 
+export const VTYPE_LABELS: Record<number, string> = {
+  0: 'SNP', 1: 'INS', 2: 'DEL', 3: 'MNP',
+}
+
 export interface Variant {
-  pos: number
-  ref: string
-  alts: string[]
-  qual: number | null
-  filter: string[]
-  type: 'SNP' | 'INS' | 'DEL' | 'MNP' | 'REF'
-  af: number | null
+  pos:   number
+  value: number       // allele frequency (cohort-level aggregate)
+  type:  number       // 0=SNP 1=INS 2=DEL 3=MNP
+  // Legacy VCF fields — not populated by gragen-service (cohort store)
+  ref?:    string
+  alts?:   string[]
+  qual?:   number | null
+  filter?: string[]
+  af?:     number | null
 }
 
 export interface DensityBin {
@@ -135,4 +141,37 @@ export const CLINSIG_COLORS: Record<number, [number, number, number]> = {
   4: [220, 40,  40],    // Pathogenic — red
   5: [160, 100, 200],   // Conflicting — purple
   6: [140, 140, 140],   // Other — grey
+}
+
+// ── Multi-source genome annotations (queried from Iceberg via /api/query) ─────
+// ClinVar (clinical significance + disease), GWAS Catalog (trait associations),
+// SFARI (autism gene regions). All three live in Snowflake-managed Iceberg
+// tables, so the frontend can query them directly without a backend rebuild.
+
+export type AnnoSource = 'clinvar' | 'gwas' | 'sfari'
+
+export interface GenomeAnnotation {
+  source:   AnnoSource
+  pos:      number                       // single locus, or gene-region midpoint
+  label:    string                       // disease / trait / gene symbol
+  sublabel?: string                      // gene · rsid · SFARI score · p-value
+  color:    [number, number, number]
+  link?:    string                       // external reference URL (no scheme)
+  clinsig?: number                       // ClinVar only — drives significance filter
+  start?:   number                       // SFARI gene region
+  end?:     number
+}
+
+export const ANNO_SOURCE_LABELS: Record<AnnoSource, string> = {
+  clinvar: '🏥 ClinVar (disease)',
+  gwas:    '📈 GWAS Catalog',
+  sfari:   '🧩 SFARI autism genes',
+}
+
+// Per-source accent colours used when a source has no intrinsic colour scale.
+export const GWAS_COLOR:  [number, number, number] = [80,  180, 255]   // cyan
+export const SFARI_COLOR: [number, number, number] = [200, 120, 255]   // violet
+// SFARI score → colour (1=high confidence … syndromic)
+export const SFARI_SCORE_COLORS: Record<string, [number, number, number]> = {
+  '1': [225, 70, 120], '2': [255, 140, 60], '3': [240, 200, 60], 'S': [160, 100, 220],
 }

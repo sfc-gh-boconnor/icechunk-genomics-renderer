@@ -170,8 +170,9 @@ def _slice_genomic(
     n_in_range = hi - lo
 
     if n_in_range == 0:
-        return {"data": [], "row_count": 0, "variable": variable,
-                "chrom": chrom, "start": start, "end": end}
+        return {"data": [], "row_count": 0, "n_in_range": 0,
+                "stride": 1, "density": None, "variables": [],
+                "variable": variable, "chrom": chrom, "start": start, "end": end}
 
     # Auto-downsample if over cap (mirrors weather stride logic)
     stride = 1
@@ -230,7 +231,7 @@ async def lifespan(app: FastAPI):
     yield
     logger.info("GRAGEN service shutting down")
 
-app = FastAPI(title="GRAGEN Service", version="1.0.17", lifespan=lifespan)
+app = FastAPI(title="GRAGEN Service", version="1.0.18", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"],
                    allow_methods=["*"], allow_headers=["*"])
 
@@ -252,7 +253,7 @@ class SeedRequest(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "1.0.17"}
+    return {"status": "ok", "version": "1.0.18"}
 
 @app.get("/meta")
 def meta():
@@ -562,7 +563,7 @@ def _slice_clinvar(
     n_in_range = hi - lo
 
     if n_in_range == 0:
-        return {"data": [], "row_count": 0, "chrom": chrom, "start": start, "end": end}
+        return {"data": [], "row_count": 0, "n_in_range": 0, "stride": 1, "chrom": chrom, "start": start, "end": end}
 
     stride = max(1, n_in_range // max_variants)
     pos_slice = positions[lo:hi:stride]

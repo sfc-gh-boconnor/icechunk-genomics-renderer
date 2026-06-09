@@ -39,7 +39,19 @@ done
 [[ -z "$ACCEL_VERSION"   ]] && ACCEL_VERSION="$CURRENT_VERSION"
 
 # ── Snowflake account details ─────────────────────────────────────────────────
-ACCOUNT=$(snow connection show "$CONNECTION" 2>/dev/null | grep '"account"' | sed 's/.*: "\(.*\)".*/\1/' | tr '[:upper:]' '[:lower:]' | sed 's/_/-/g' || echo "")
+ACCOUNT=$(python3 -c "
+import re, os
+path = os.path.expanduser('~/.snowflake/connections.toml')
+with open(path) as f: txt = f.read()
+conn = '${CONNECTION}'.replace('-', '_').lower()
+# Try both dashes and underscores in section name
+for name in ['${CONNECTION}', conn]:
+    m = re.search(r'\[' + re.escape(name) + r'\][^\[]*account\s*=\s*[\"\'](.*?)[\"\']', txt, re.DOTALL | re.IGNORECASE)
+    if m:
+        print(m.group(1).lower().replace('_', '-'))
+        exit(0)
+print('')
+" 2>/dev/null || echo "")
 DB="gragen_db"
 SCHEMA="gragen"
 REGISTRY="${ACCOUNT}.registry.snowflakecomputing.com/${DB}/${SCHEMA}/gragen_repo"
@@ -88,7 +100,19 @@ spec:
   - name: gragen-service
     image: /${DB}/${SCHEMA}/gragen_repo/gragen-service:${SERVICE_VERSION}
     env:
-      PYTHONUNBUFFERED: \"1\"
+      PYTHONUNBUFFERED:           \"1\"
+      ICECHUNK_BUCKET:            \"icechunk-ro\"
+      ICECHUNK_GENOMICS_PREFIX:   \"genomics_repo\"
+      ICECHUNK_CLINVAR_PREFIX:    \"clinvar_repo\"
+      AWS_DEFAULT_REGION:         \"us-west-2\"
+      INGEST_WORKERS:             \"16\"
+    secrets:
+    - snowflakeSecret:
+        objectName: ICECHUNK_DB.ICECHUNK.AWS_ACCESS_KEY_ID
+      envVarName: AWS_ACCESS_KEY_ID
+    - snowflakeSecret:
+        objectName: ICECHUNK_DB.ICECHUNK.AWS_SECRET_ACCESS_KEY
+      envVarName: AWS_SECRET_ACCESS_KEY
     readinessProbe:
       port: 8080
       path: /health
@@ -98,7 +122,7 @@ spec:
     public: false
 \$\$"
   echo ">>> Re-applying backend EAI…"
-  snow sql -c "$CONNECTION" -q "ALTER SERVICE GRAGEN_DB.GRAGEN.GRAGEN_SERVICE SET EXTERNAL_ACCESS_INTEGRATIONS = (GENOMICS_1000G_EAI);"
+  snow sql -c "$CONNECTION" -q "ALTER SERVICE GRAGEN_DB.GRAGEN.GRAGEN_SERVICE SET EXTERNAL_ACCESS_INTEGRATIONS = (ICECHUNK_S3_EAI, GENOMICS_1000G_EAI);"
   echo ">>> Backend deployed."
 fi
 
@@ -113,6 +137,7 @@ spec:
     image: /${DB}/${SCHEMA}/gragen_repo/gragen-accelerator:${ACCEL_VERSION}
     env:
       GRAGEN_SERVICE_URL: http://gragen-service:8080
+      SNOWFLAKE_WAREHOUSE: GRAGEN_WH
     readinessProbe:
       port: 3001
       path: /healthz

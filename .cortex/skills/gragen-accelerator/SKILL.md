@@ -1,6 +1,6 @@
 ---
 name: gragen-accelerator
-description: "Deploy the GRAGEN Genomics Accelerator on Snowflake Container Services (SPCS). Ingests 1000 Genomes DRAGEN VCF files from a public S3 bucket into an IceChunk Zarr store (same pattern as the weather/NetCDF project), then serves variant slice queries and cohort QC analytics via a FastAPI backend + React/DeckGL frontend. Use when: deploying GRAGEN accelerator, genomics IceChunk SPCS, 1000 Genomes DRAGEN visualisation, VCF to IceChunk pipeline, genomics Cortex Agent, variant browser Snowflake."
+description: "Deploy the GRAGEN Genomics Accelerator on Snowflake Container Services (SPCS). Ingests 1000 Genomes DRAGEN VCF files from a public S3 bucket into an IceChunk Zarr store (same pattern as the weather/NetCDF project), then serves variant slice queries and cohort QC analytics via a FastAPI backend + React/DeckGL frontend. Includes a genome-wide annotation layer in Snowflake-managed Iceberg tables (ClinVar disease/gene, GWAS Catalog, SFARI autism genes) rendered as interactive markers on a 3D DNA helix, with chat-driven control. Use when: deploying GRAGEN accelerator, genomics IceChunk SPCS, 1000 Genomes DRAGEN visualisation, VCF to IceChunk pipeline, genomics annotations Iceberg, ClinVar GWAS SFARI, 3D DNA helix variant viewer, genomics Cortex Agent, variant browser Snowflake."
 ---
 
 # GRAGEN Genomics Accelerator — SPCS Deployment
@@ -96,6 +96,48 @@ Snowflake:
 | `<REGISTRY>` | `<account>.registry.snowflakecomputing.com/gragen_db/gragen/gragen_repo` |
 | S3 bucket | `icechunk-ro` (shared with weather project, prefix `genomics_repo/`) |
 | Public source | `s3://1000genomes-dragen` (no credentials needed) |
+
+---
+
+## Deploy the whole accelerator as a skill
+
+This skill **is** the deployment playbook. To hand the full build to someone else
+(a customer, a teammate), give them the repo + this skill and let Cortex Code drive it.
+
+**1. Get the repo + skill.** The skill lives at
+`.cortex/skills/gragen-accelerator/SKILL.md` inside the `ICECHUNK_GENOMICS` repo, so a
+`git clone` of the repo brings the skill with it. Cortex Code auto-discovers skills under
+`.cortex/skills/`. To install it standalone instead, copy that folder into
+`~/.snowflake/cortex/plugins/gragen-accelerator/` (or share it — see step 2).
+
+**2. (Optional) Share the skill to other users in the account.** Run `/share-skill` in
+Cortex Code (publishes it as a Cortex Extension); recipients install it from the catalog
+with `/find-skill`.
+
+**3. Prerequisites the operator needs** (see Prerequisites above): `snow` CLI connection
+(`internal-marketplace`), Docker with `buildx`, the weather IceChunk project already
+deployed (reuses the `icechunk-ro` S3 bucket + `ICECHUNK_DB.ICECHUNK.AWS_ACCESS_KEY_ID` /
+`AWS_SECRET_ACCESS_KEY` secrets).
+
+**4. Invoke the skill and follow it end-to-end.** Ask Cortex Code to *"deploy the GRAGEN
+accelerator"* (this skill loads) and it walks through Steps 0–9 + the annotation tables +
+the genome-wide ingest. In short, the operator runs:
+
+```bash
+snow sql -f sql/01_setup.sql -c internal-marketplace                 # DB, pool, EAIs, role
+snow spcs image-registry login -c internal-marketplace
+bash deploy.sh                                                       # build+push+deploy both images
+snow sql -f sql/02_external_functions.sql -c internal-marketplace    # ext fns + GENOMICS_AGENT + tools
+# seed chr22 variants + ClinVar (Steps 3–4), then load annotation + pedigree tables:
+python3 app/build_clinvar_iceberg.py     # + COPY INTO CHR22_CLINVAR
+python3 app/build_gwas_iceberg.py        # + COPY INTO CHR22_GWAS
+snow sql -f app/build_sfari_iceberg.sql  -c internal-marketplace
+python3 app/build_pedigree_iceberg.py && snow sql -f app/build_pedigree_iceberg.sql -c internal-marketplace
+```
+
+**5. Re-apply grants** after any service/agent recreate (see Critical Rules #6, #8–11):
+endpoint grants to `PUBLIC`, `SELECT` on Iceberg tables to `PUBLIC`/`GRAGEN_DB_ROLE`, and
+`USAGE` on the agent + tool procedures to `GRAGEN_DB`, `GRAGEN_DB_ROLE`, `SYSADMIN`, `ICECHUNK_DB`.
 
 ---
 
@@ -272,7 +314,126 @@ curl -X POST https://<URL>/api/direct/seed_clinvar \
 
 ---
 
-## Critical Rules
+## Genome-Wide Annotation Layer (Iceberg) — v1.0.26
+
+The 3D DNA helix overlays **clinical / research annotations** on top of the cohort
+variants. These annotations live in **Snowflake-managed Iceberg tables**, NOT in Zarr.
+
+### Why two storage tiers?
+
+| Data | Store | Why |
+|------|-------|-----|
+| **Cohort variants** (allele frequency, het rate per position) — millions of rows per chromosome | **IceChunk Zarr** (`genomics_repo/`) | Huge, numeric, range-sliced by `np.searchsorted`. Too large for Iceberg; never materialised to a table. |
+| **Annotations** (ClinVar disease/gene, GWAS traits, SFARI genes) — thousands–millions of *reference* rows | **Snowflake Iceberg** (`GENOMICS_ICEBERG_VOLUME`) | Small, categorical, queried by the **frontend directly via `/api/query`**. No backend rebuild needed to add/refresh annotations. |
+
+> **Architectural enabler:** the frontend `/api/query` endpoint runs arbitrary SQL
+> against Snowflake. New annotation sources become available the moment their Iceberg
+> table is loaded — **no container image rebuild, no `ALTER SERVICE`.**
+
+### Annotation tables
+
+All created with `EXTERNAL_VOLUME='GENOMICS_ICEBERG_VOLUME' ICEBERG_VERSION=2 CATALOG='SNOWFLAKE'`
+in `GRAGEN_DB.GRAGEN`. (Table names keep the `CHR22_` prefix for historical reasons but
+hold **genome-wide** rows — they are filtered by `CHROM` + `POSITION`.)
+
+| Table | Rows | Builder (re-runnable) | Columns |
+|-------|------|-----------------------|---------|
+| `CHR22_CLINVAR` | ~4.43M | `app/build_clinvar_iceberg.py` | `CHROM, POSITION, CLINSIG, REVSTAT, ALLELE_ID, REF_LEN, ALT_LEN, DISEASE, GENE` |
+| `CHR22_GWAS` | ~10–15K | `app/build_gwas_iceberg.py` | `CHROM, POSITION, TRAIT, MAPPED_GENE, RSID, RISK_ALLELE, P_VALUE` |
+| `AUTISM_GENES` | 25 | `app/build_sfari_iceberg.sql` | `GENE, CHROM, START_POS, END_POS, SFARI_SCORE, NOTE` |
+| `SAMPLE_PEDIGREE` | 3202 | `app/build_pedigree_iceberg.py` (+`.sql`) | `SAMPLE_ID, FATHER_ID, MOTHER_ID, SEX, RELATIONSHIP` — 1000G trio pedigree; powers father/mother links in the sample panel |
+
+`CLINSIG` encoding (matches frontend `CLINSIG_COLORS`): `0=Benign 1=Likely benign
+2=VUS 3=Likely pathogenic 4=Pathogenic 5=Conflicting 6=Other`.
+
+### Step 8: Load annotation tables
+
+```bash
+# 1. ClinVar (genome-wide, ~4.4M rows) — parses ClinVar VCF via per-chrom TBI byte-range,
+#    extracts disease (CLNDN) + gene (GENEINFO). Re-run anytime to refresh.
+python3 app/build_clinvar_iceberg.py          # writes /tmp/clinvar_all.csv
+snow sql -c <CONNECTION> --warehouse GRAGEN_WH -q "
+  CREATE OR REPLACE ICEBERG TABLE GRAGEN_DB.GRAGEN.CHR22_CLINVAR (
+    CHROM STRING, POSITION INT, CLINSIG INT, REVSTAT INT, ALLELE_ID INT,
+    REF_LEN INT, ALT_LEN INT, DISEASE STRING, GENE STRING)
+  EXTERNAL_VOLUME='GENOMICS_ICEBERG_VOLUME' ICEBERG_VERSION=2 CATALOG='SNOWFLAKE'
+  BASE_LOCATION='chr22_clinvar/';"
+# PUT + COPY INTO from @GRAGEN_DB.GRAGEN.GRAGEN_LOAD_STAGE (see load pattern below)
+
+# 2. GWAS Catalog (EBI REST API per trait — associations embed location/gene/p-value)
+python3 app/build_gwas_iceberg.py             # writes /tmp/gwas_all.csv
+#    table CHR22_GWAS, BASE_LOCATION='chr22_gwas/'
+
+# 3. SFARI autism genes (curated list, no external fetch — single SQL file)
+snow sql -c <CONNECTION> --warehouse GRAGEN_WH -f app/build_sfari_iceberg.sql
+```
+
+**Load pattern (CSV → Iceberg via stage):**
+```sql
+PUT file:///tmp/clinvar_all.csv @GRAGEN_DB.GRAGEN.GRAGEN_LOAD_STAGE
+  OVERWRITE=TRUE AUTO_COMPRESS=TRUE;
+COPY INTO GRAGEN_DB.GRAGEN.CHR22_CLINVAR
+  FROM @GRAGEN_DB.GRAGEN.GRAGEN_LOAD_STAGE/clinvar_all.csv
+  FILE_FORMAT=(TYPE=CSV SKIP_HEADER=1 FIELD_OPTIONALLY_ENCLOSED_BY='"' EMPTY_FIELD_AS_NULL=TRUE);
+```
+
+### Step 9: Genome-wide variant ingest (Zarr only, per-chromosome commit)
+
+`ingest_genomics.py` commits **per chromosome** (fresh writable session + commit + tag
+inside the loop). Each chromosome becomes queryable the moment it finishes, and a crash
+mid-run loses only the in-flight chromosome. Sample data is **never** written to Iceberg.
+
+```bash
+# Trigger remaining chromosomes (chr22 already seeded). Smallest-first for fast wins.
+curl -X POST https://<URL>/api/direct/seed_genomics \
+  -d '{"chroms": ["chr21","chr19","chr20","chr18","chr17","chr16","chr15","chr14",
+       "chr13","chr12","chr11","chr10","chr9","chr8","chr7","chr6","chr5","chr4",
+       "chr3","chr2","chr1","chrX"]}'
+```
+
+### Frontend: multi-source annotation UI
+
+- **`types.ts`** — `GenomeAnnotation { source, pos, label, sublabel?, color, link?, clinsig?, start?, end? }`,
+  `AnnoSource = 'clinvar' | 'gwas' | 'sfari'`, `ANNO_SOURCE_LABELS`.
+- **`DNAHelix.tsx`** — `AnnoMarker` renders source-specific shapes (icosahedron=ClinVar,
+  octahedron=GWAS, box=SFARI gene) on stalks off the backbone; hovering pauses spin,
+  flies the camera in (`CameraRig`), and shows a generalized annotation card. A source
+  dropdown + (ClinVar-only) significance filter live in the top-right control bar.
+- **`GenomicsViewer.tsx`** — `loadAnnotations()` queries the relevant Iceberg table via
+  `/api/query` for the current `chrom`/region and maps rows → `GenomeAnnotation[]`.
+  `applyChatIntent()` parses chat for: pathogenic filter, ClinVar/GWAS/SFARI source switch,
+  chromosome/region jump, "jump to <gene>" (queries `AUTISM_GENES`), and sample gender switch.
+  Sparse sources (GWAS/SFARI) auto-navigate (`goToRegion`) to where data exists.
+- **Trio family** — the sample panel shows clickable **father/mother** buttons (from
+  `SAMPLE_PEDIGREE`) that switch the active sample, for parent-vs-child comparison.
+
+### Cortex Agent tools (GENOMICS_AGENT)
+
+The agent uses `type: generic` tools backed by Python stored procedures (warehouse exec env):
+
+| Tool | Procedure | Purpose |
+|------|-----------|---------|
+| `tool_cohort_query` | `TOOL_COHORT_QUERY` | QC stats grouped by superpopulation |
+| `tool_sample_meta` | `TOOL_SAMPLE_META` | QC metrics for one sample |
+| `tool_find_outliers` | `TOOL_FIND_OUTLIERS` | top/bottom samples by metric |
+| `tool_query_annotations` | `TOOL_QUERY_ANNOTATIONS` | ClinVar/GWAS/SFARI by region, gene, or summary |
+| `tool_pedigree` | `TOOL_PEDIGREE` | trio father/mother/children for a sample |
+
+> **Gotcha:** Snowpark `Row` → use `row.as_dict()`, not `dict(row)` (else "dictionary update
+> sequence element"). `CREATE OR REPLACE AGENT` **drops all grants** — re-grant `USAGE ON AGENT`
+> + every tool procedure to `GRAGEN_DB`, `GRAGEN_DB_ROLE`, `SYSADMIN`, **and `ICECHUNK_DB`**
+> (the frontend service identity), or the agent API returns 401.
+
+### Origins globe + theme
+
+- **3D globe** (`CohortGlobe.tsx`) uses **react-three-fiber** (the deck.gl `_GlobeView` is
+  experimental and renders blank). Earth texture bundled at `public/earth-blue-marble.jpg`.
+  The `<Canvas>` needs an explicit container height or it collapses.
+- **Dark Snowflake theme** (`src/index.css`): tokens `--bg #0D1117 / --surface #161B22 /
+  --surface-2 #1E2A3A / --border #2D3F53 / --accent #29B5E8`; branded sidebar + grouped nav +
+  `app-header` + panels. Visualization canvases stay near-black (`#03060f`).
+
+---
 
 1. **Both IceChunk stores must be seeded before queries work:**
    - `genomics_repo/` (1000G variants) → seed via `POST /api/direct/seed_genomics`
@@ -302,7 +463,7 @@ curl -X POST https://<URL>/api/direct/seed_clinvar \
    spec:
      containers:
      - name: seed
-       image: /gragen_db/gragen/gragen_repo/gragen-service:1.0.17
+       image: /gragen_db/gragen/gragen_repo/gragen-service:<VERSION>
        command: ["python3", "/app/seed_job.py"]
        env:
          SEED_TYPE: genomics
@@ -337,6 +498,25 @@ curl -X POST https://<URL>/api/direct/seed_clinvar \
 
 7. **chr22 first** — smallest autosome, validates the full pipeline in ~15 minutes total.
 
+8. **Backend `ALTER SERVICE` spec MUST carry the full env + secrets + both EAIs.**
+   `ALTER SERVICE … FROM SPECIFICATION` **replaces** the entire spec — any omitted
+   `secrets:` / `env:` block is dropped, silently removing S3 credentials. The
+   `gragen-service` spec (in `deploy.sh` and `sql/03_deploy_services.sql`) must always include:
+   ```yaml
+   env: { PYTHONUNBUFFERED: "1", ICECHUNK_BUCKET: icechunk-ro,
+          ICECHUNK_GENOMICS_PREFIX: genomics_repo, ICECHUNK_CLINVAR_PREFIX: clinvar_repo,
+          AWS_DEFAULT_REGION: us-west-2, INGEST_WORKERS: "16" }
+   secrets:
+   - { snowflakeSecret: { objectName: ICECHUNK_DB.ICECHUNK.ICECHUNK_AWS_KEY_ID }, envVarName: AWS_ACCESS_KEY_ID }
+   - { snowflakeSecret: { objectName: ICECHUNK_DB.ICECHUNK.ICECHUNK_AWS_SECRET_KEY }, envVarName: AWS_SECRET_ACCESS_KEY }
+   ```
+   then `SET EXTERNAL_ACCESS_INTEGRATIONS = (ICECHUNK_S3_EAI, GENOMICS_1000G_EAI);`
+   Symptom of a stripped spec: backend 503 / IceChunk repo not found after a backend deploy.
+
+9. **Annotations live in Iceberg, sample/variant data lives in Zarr.** Never materialise
+   cohort variants to a Snowflake table (size). Add annotation sources by loading an Iceberg
+   table — the frontend queries it via `/api/query` with no backend rebuild.
+
 ---
 
 ## Troubleshooting
@@ -359,6 +539,14 @@ curl -X POST https://<URL>/api/direct/seed_clinvar \
 
 | Version | Date | Notes |
 |---------|------|-------|
+| v1.0.30 | 2026-06-09 | Trio family links (clickable father/mother in sample panel) from new `SAMPLE_PEDIGREE` Iceberg table (1000G 3,202 pedigree). Gosling tracks now fill the viewport height. Agent gains `tool_pedigree` (father/mother/children). |
+| v1.0.29 | 2026-06-09 | Dark Snowflake "module" restyle: ICECHUNK palette (`#0D1117/#161B22/#2D3F53`, accent `#29B5E8`), branded sidebar + grouped nav + app-header + panels (`src/index.css`, `GenomicsViewer.tsx`). Viz canvases stay near-black. |
+| v1.0.28 | 2026-06-09 | Origins globe rebuilt with react-three-fiber + bundled Earth texture (deck.gl `_GlobeView` rendered blank). Annotation auto-navigation for sparse GWAS/SFARI sources (`goToRegion`). Fixed "annotations always 0" (GRANT SELECT on Iceberg tables to PUBLIC). Added `tool_query_annotations` to GENOMICS_AGENT; fixed `dict(row)`→`as_dict()` in all agent tools; re-granted agent USAGE after recreate. |
+| v1.0.26 | 2026-06-08 | Genome-wide annotation layer in Iceberg: `CHR22_CLINVAR` (+DISEASE/GENE, 4.43M rows), `CHR22_GWAS` (EBI GWAS Catalog), `AUTISM_GENES` (SFARI, 25 genes). Multi-source 3D helix markers (ClinVar/GWAS/SFARI) with source dropdown, hover-zoom cards, chat-driven control (`applyChatIntent`). `ingest_genomics` commits per-chromosome (durable/incremental). Fixed `deploy.sh` backend spec dropping AWS secrets + `ICECHUNK_S3_EAI`. |
+| v1.0.25 | 2026-06-08 | ClinVar annotations on the 3D helix (hover marker → zoom + disease card). |
+| v1.0.24 | 2026-06-08 | Click a helix variant → agent explains; chat panel zooms the helix to the region. |
+| v1.0.23 | 2026-06-08 | DNA-accurate double helix (base-pair rungs, zoom); fixed gosling `rgb2hex` (pixi.js pinned ~6.5.10). |
+| v1.0.22 | 2026-06-08 | Fixed blank screen — rebuilt frontend with React 18 deps (was React 19/drei 10). |
 | v1.0.17 | 2026-06-08 | Production release: chr22 genomics (1.93M variants, 3201 samples) + ClinVar seeded. Replaced pysam HTTP with boto3/urllib TBI range requests (SPCS EAI proxy fix). seed_job.py for EXECUTE JOB SERVICE. POST /meta endpoint. int8→int16 for ref_len. Zarr create_array dtype fix. |
 | v1.0.3 | 2026-06-07 | ClinVar overlay: IceChunk clinvar_repo/, /seed_clinvar, /direct/clinvar, CLINSIG overlay track in genome browser, CLINVAR_SLICE external function, NCBI_FTP_EAI |
 | v1.0.2 | 2026-06-07 | CSP fix (remove Google Fonts), GENOMICS_1000G_EAI created, GRAGEN_DB role + endpoint grants |

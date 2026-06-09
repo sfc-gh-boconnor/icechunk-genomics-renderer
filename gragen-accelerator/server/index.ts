@@ -191,6 +191,34 @@ app.post('/api/query', async (req: Request, res: Response) => {
 })
 
 // ── Direct proxy to gragen-service ─────────────────────────────────────────────
+// Direct proxy via public endpoint with service token auth (bypasses SPCS inter-service TCP issue)
+const GRAGEN_PUBLIC_URL = process.env.GRAGEN_PUBLIC_URL || ''
+
+async function proxyDirect(path: string, body: unknown, res: Response) {
+  if (!GRAGEN_PUBLIC_URL) {
+    // Fall back to SQL service function approach
+    return proxyToService(path, body, res)
+  }
+  try {
+    const svcToken = getServiceToken()
+    const upstream = await fetch(`${GRAGEN_PUBLIC_URL}${path}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(svcToken ? { 'Authorization': `Snowflake Token="${svcToken}"` } : {}),
+      },
+      body: JSON.stringify(body),
+    })
+    const data = await upstream.json()
+    res.status(upstream.status).json(data)
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    console.error('[proxyDirect] failed, falling back to SQL:', msg)
+    // Fall back to SQL approach
+    return proxyToService(path, body, res)
+  }
+}
+
 async function proxyToService(path: string, body: unknown, res: Response) {
   try {
     const upstream = await fetch(`${GRAGEN_SERVICE_URL}${path}`, {
@@ -199,18 +227,71 @@ async function proxyToService(path: string, body: unknown, res: Response) {
       body: JSON.stringify(body),
     })
     const data = await upstream.json()
-    res.json(data)
+    res.status(upstream.status).json(data)   // forward upstream HTTP status
   } catch (err) {
-    res.status(502).json({ error: err instanceof Error ? err.message : String(err) })
+    const msg = err instanceof Error ? err.message : String(err)
+    console.error('[proxy] ERROR proxying to', path, ':', msg)
+    res.status(502).json({ error: msg })
   }
 }
 
-app.post('/api/direct/variants', (req: Request, res: Response) => {
-  proxyToService('/direct/variants', req.body, res)
+app.post('/api/direct/variants', async (req: Request, res: Response) => {
+  // Use SQL service function instead of direct HTTP (inter-service TCP unreliable)
+  const { chrom = 'chr22', start = 20900000, end = 21100000, variable = 'allele_freq' } = (req.body ?? {}) as Record<string, unknown>
+  try {
+    const sql = `SELECT GRAGEN_DB.GRAGEN.GRAGEN_SLICE(
+      '${String(chrom)}', ${Number(start)}, ${Number(end)}
+    ) AS result`
+    const rows = await runSql(sql, 'GRAGEN_DB', 'GRAGEN')
+    const raw = rows[0] as Record<string, unknown>
+    let result = raw['RESULT'] ?? raw['result']
+    if (typeof result === 'string') { try { result = JSON.parse(result) } catch { /* keep as-is */ } }
+    const r = (result ?? {}) as Record<string, unknown>
+    if (!r || Object.keys(r).length === 0) { res.status(500).json({ detail: 'Empty result from GRAGEN_SLICE' }); return }
+    // Map service function format to direct format
+    res.json({
+      chrom:      r['chrom']      ?? chrom,
+      start:      r['start']      ?? start,
+      end:        r['end']        ?? end,
+      count:      r['row_count']  ?? 0,
+      n_in_range: r['n_in_range'] ?? 0,
+      stride:     r['stride']     ?? 1,
+      variables:  r['variables']  ?? [],
+      variants:   r['data']       ?? [],
+      density:    r['density']    ?? null,
+      truncated:  (r['stride'] as number ?? 1) > 1,
+    })
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    console.error('[variants] SQL error:', msg)
+    res.status(502).json({ detail: msg })
+  }
 })
 
-app.post('/api/direct/clinvar', (req: Request, res: Response) => {
-  proxyToService('/direct/clinvar', req.body, res)
+app.post('/api/direct/clinvar', async (req: Request, res: Response) => {
+  // Use SQL service function instead of direct HTTP
+  const { chrom = 'chr22', start = 20900000, end = 21100000 } = (req.body ?? {}) as Record<string, unknown>
+  try {
+    const sql = `SELECT GRAGEN_DB.GRAGEN.GRAGEN_CLINVAR_SLICE(
+      '${String(chrom)}', ${Number(start)}, ${Number(end)}
+    ) AS result`
+    const rows = await runSql(sql, 'GRAGEN_DB', 'GRAGEN')
+    const raw = rows[0] as Record<string, unknown>
+    let result = raw['RESULT'] ?? raw['result']
+    if (typeof result === 'string') { try { result = JSON.parse(result) } catch { /* keep */ } }
+    const r = (result ?? {}) as Record<string, unknown>
+    res.json({
+      chrom:    r['chrom']     ?? chrom,
+      start:    r['start']     ?? start,
+      end:      r['end']       ?? end,
+      count:    r['row_count'] ?? 0,
+      variants: r['data']      ?? [],
+    })
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    console.error('[clinvar] SQL error:', msg)
+    res.status(502).json({ detail: msg })
+  }
 })
 
 app.post('/api/direct/seed_clinvar', (req: Request, res: Response) => {
@@ -331,9 +412,14 @@ app.post('/api/agent/chat', async (req: Request, res: Response) => {
     res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
 
   const host = SF_HOST || ''
-  if (!host) { emit('error', { error: 'SNOWFLAKE_HOST not set' }); res.end(); return }
+  console.error('[agent] host=', host ? host.slice(0,40) : 'EMPTY', 'agent=', `${AGENT_DB}.${AGENT_SCHEMA}.${AGENT_NAME}`)
+  if (!host) { console.error('[agent] ERROR: SNOWFLAKE_HOST not set'); emit('error', { error: 'SNOWFLAKE_HOST not set — add SNOWFLAKE_HOST to service spec' }); res.end(); return }
 
+  // Use SPCS service identity token (OAuth) — exactly like icechunk accelerator.
+  // This works when the service runs as a non-admin role (GRAGEN_SERVICE_ROLE)
+  // that has SNOWFLAKE.CORTEX_USER and USAGE on GENOMICS_AGENT.
   const authToken = getServiceToken()
+  console.error('[agent] token available:', !!authToken, 'source:', process.env.SNOWFLAKE_TOKEN ? 'env' : 'file')
   if (!authToken) { emit('error', { error: 'No SPCS service token' }); res.end(); return }
 
   const messages = [
@@ -356,6 +442,7 @@ app.post('/api/agent/chat', async (req: Request, res: Response) => {
     })
     if (!agentRes.ok) {
       const errText = await agentRes.text()
+      console.error('[agent] API error', agentRes.status, errText.slice(0, 500))
       emit('error', { error: `Cortex Agent API ${agentRes.status}: ${errText.slice(0, 400)}` })
       res.end(); return
     }
@@ -372,7 +459,7 @@ app.post('/api/agent/chat', async (req: Request, res: Response) => {
       buffer = lines.pop() ?? ''
       let currentEvent = ''
       for (const line of lines) {
-        if (line.startsWith('event: ')) { currentEvent = line.slice(7).trim(); continue }
+        if (line.startsWith('event: ')) { currentEvent = line.slice(7).trim(); console.error('[agent] event:', currentEvent); continue }
         if (!line.startsWith('data: ')) continue
         const data = line.slice(6).trim()
         if (!data || data === '[DONE]') continue
@@ -381,6 +468,10 @@ app.post('/api/agent/chat', async (req: Request, res: Response) => {
           if (currentEvent === 'response.text.delta') {
             const text = parsed.text as string ?? ''
             if (text) { fullText += text; emit('token', { text }) }
+          } else if (currentEvent === 'response.tool_use') {
+            emit('status', { label: `Querying ${(parsed.name as string ?? 'tool').replace('tool_', '')}…` })
+          } else if (currentEvent && currentEvent !== 'response.completed') {
+            console.error('[agent] event data:', currentEvent, JSON.stringify(parsed).slice(0, 80))
           }
         } catch { /* skip */ }
       }

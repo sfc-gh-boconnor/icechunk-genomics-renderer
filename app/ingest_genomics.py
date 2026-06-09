@@ -435,8 +435,6 @@ def ingest_genomics(
         logger.info(f"[ingest] Found {len(samples)} samples in hg38-graph-based build")
 
     repo = open_or_create_genomics_repo()
-    session = repo.writable_session("main")
-    root = zarr.open_group(session.store, mode="a")
 
     summary = {
         "chromosomes": [],
@@ -444,33 +442,37 @@ def ingest_genomics(
         "started_at": datetime.now(timezone.utc).isoformat(),
     }
 
+    # Commit per-chromosome so progress is durable and each chromosome becomes
+    # queryable as soon as it finishes (important for long genome-wide runs).
     for chrom in target_chroms:
         logger.info(f"[ingest] === Processing {chrom} ===")
         arrays = _aggregate_chromosome(chrom, samples, max_workers=max_workers)
         if not arrays:
             logger.warning(f"[ingest] {chrom}: no variants found, skipping")
             continue
+        session = repo.writable_session("main")
+        root = zarr.open_group(session.store, mode="a")
         _write_chromosome(root, chrom, arrays, len(samples))
+        snapshot_id = session.commit(
+            message=f"Ingested {chrom} from {len(samples)} DRAGEN samples"
+        )
+        try:
+            repo.create_tag(
+                f"{chrom}_v1_{len(samples)}samples_"
+                + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"),
+                snapshot_id,
+            )
+        except Exception as e:
+            logger.warning(f"[ingest] {chrom}: tag failed (non-fatal): {e}")
         summary["chromosomes"].append({
             "chrom":    chrom,
             "n_vars":   int(len(arrays["position"])),
             "pos_min":  int(arrays["position"].min()),
             "pos_max":  int(arrays["position"].max()),
+            "snapshot": str(snapshot_id),
         })
+        logger.info(f"[ingest] {chrom}: committed snapshot {snapshot_id}")
 
-    # Commit snapshot
-    tag = (
-        "+".join(target_chroms) + f"_v1_{len(samples)}samples_"
-        + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    )
-    snapshot_id = session.commit(
-        message=f"Ingested {', '.join(target_chroms)} from {len(samples)} DRAGEN samples"
-    )
-    repo.create_tag(tag, snapshot_id)
-
-    summary["snapshot_id"] = str(snapshot_id)
-    summary["tag"] = tag
     summary["finished_at"] = datetime.now(timezone.utc).isoformat()
-
-    logger.info(f"[ingest] Done. Snapshot: {snapshot_id}, tag: {tag}")
+    logger.info(f"[ingest] Done. Chromosomes: {[c['chrom'] for c in summary['chromosomes']]}")
     return summary

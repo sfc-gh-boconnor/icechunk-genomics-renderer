@@ -34,10 +34,10 @@ spec:
       INGEST_WORKERS:             "16"
     secrets:
     - snowflakeSecret:
-        objectName: ICECHUNK_DB.ICECHUNK.ICECHUNK_AWS_KEY_ID
+        objectName: ICECHUNK_DB.ICECHUNK.AWS_ACCESS_KEY_ID
       envVarName: AWS_ACCESS_KEY_ID
     - snowflakeSecret:
-        objectName: ICECHUNK_DB.ICECHUNK.ICECHUNK_AWS_SECRET_KEY
+        objectName: ICECHUNK_DB.ICECHUNK.AWS_SECRET_ACCESS_KEY
       envVarName: AWS_SECRET_ACCESS_KEY
     readinessProbe:
       port: 8080
