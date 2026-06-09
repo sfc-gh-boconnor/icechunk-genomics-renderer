@@ -185,9 +185,13 @@ export function FamilyConstellation({ onPickSample }: Props) {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            sql: `SELECT p.SAMPLE_ID, p.FATHER_ID, p.MOTHER_ID, p.SEX, m.SUPERPOPULATION, m.POPULATION
+            sql: `SELECT p.SAMPLE_ID, p.FATHER_ID, p.MOTHER_ID, p.SEX,
+                         COALESCE(mc.SUPERPOPULATION, mf.SUPERPOPULATION, mm.SUPERPOPULATION) AS SUPERPOPULATION,
+                         COALESCE(mc.POPULATION,      mf.POPULATION,      mm.POPULATION)      AS POPULATION
                     FROM GRAGEN_DB.GRAGEN.SAMPLE_PEDIGREE p
-                    LEFT JOIN GRAGEN_DB.GRAGEN.SAMPLE_METRICS m ON m.SAMPLE_ID = p.SAMPLE_ID
+                    LEFT JOIN GRAGEN_DB.GRAGEN.SAMPLE_METRICS mc ON mc.SAMPLE_ID = p.SAMPLE_ID
+                    LEFT JOIN GRAGEN_DB.GRAGEN.SAMPLE_METRICS mf ON mf.SAMPLE_ID = p.FATHER_ID
+                    LEFT JOIN GRAGEN_DB.GRAGEN.SAMPLE_METRICS mm ON mm.SAMPLE_ID = p.MOTHER_ID
                    WHERE p.FATHER_ID <> '0' AND p.MOTHER_ID <> '0'`,
             database: 'GRAGEN_DB', schema: 'GRAGEN',
           }),
