@@ -128,6 +128,20 @@ python3 app/build_gwas_iceberg.py       # EBI GWAS → /tmp/gwas_all.csv
    (served at `/earth-blue-marble.jpg`). The r3f `<Canvas>` needs an explicit container height
    (`height:100%` + `minHeight`) or it collapses.
 
+13. **Genome browser fetches variants via SQL service functions, not `/api/direct`.**
+   `gragen-accelerator/server/index.ts` calls `GRAGEN_SLICE(CHROM,START,END)` and
+   `GRAGEN_CLINVAR_SLICE(CHROM,START,END)` (3 args, **no sample_id**). These are SPCS
+   **service functions** bound to `GRAGEN_SERVICE` (`CREATE FUNCTION … SERVICE=GRAGEN_SERVICE
+   ENDPOINT='api-endpoint' AS '/slice'`), created in `sql/02_external_functions.sql` — which
+   must run **after** `deploy.sh` (the service must exist). Symptom if missing/disabled:
+   "Unknown user-defined function GRAGEN_DB.GRAGEN.GRAGEN_SLICE" on Fetch Variants.
+
+14. **Restart the backend after an out-of-container ingest.** The backend caches its IceChunk
+   repo handle (`_repo`). An `EXECUTE JOB SERVICE` ingest commits new snapshots the backend's
+   cached handle won't see, so the genome browser stays empty even though the store has data.
+   Fix: `ALTER SERVICE GRAGEN_DB.GRAGEN.GRAGEN_SERVICE SUSPEND;` then `RESUME;`. (In-container
+   `/seed_genomics` self-invalidates the cache; external jobs do not.)
+
 ---
 
 ## Frontend annotation/chat wiring

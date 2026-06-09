@@ -17,13 +17,28 @@ USE WAREHOUSE GRAGEN_WH;
 -- the grants succeed on a fresh account too.
 CREATE ROLE IF NOT EXISTS GRAGEN_DB_ROLE;
 
--- ── (Optional, legacy) GRAGEN_SLICE / CLINVAR_SLICE external functions ────────
--- DISABLED for fresh-account / parameterized deploys: these used an API
--- integration with a hardcoded <GRAGEN_SERVICE_ENDPOINT> placeholder, which
--- can't be created automatically. The app reads variants/ClinVar via the
--- backend's /api/direct/* endpoints and Iceberg via /api/query, so these
--- external functions are not required. To enable them, configure an SPCS
--- service function against GRAGEN_SERVICE manually.
+-- ── SPCS service functions: GRAGEN_SLICE / GRAGEN_CLINVAR_SLICE ──────────────
+-- The genome browser fetches variants via these SQL functions (server/index.ts
+-- calls GRAGEN_SLICE(chrom,start,end) and GRAGEN_CLINVAR_SLICE(chrom,start,end)).
+-- They are SPCS *service functions* bound to GRAGEN_SERVICE's api-endpoint — NOT
+-- API-integration external functions. The backend handlers are POST /slice and
+-- POST /slice_clinvar. Run AFTER the backend service exists (deploy.sh).
+CREATE OR REPLACE FUNCTION GRAGEN_DB.GRAGEN.GRAGEN_SLICE(CHROM VARCHAR, START_POS INTEGER, END_POS INTEGER)
+  RETURNS VARIANT
+  SERVICE = GRAGEN_DB.GRAGEN.GRAGEN_SERVICE
+  ENDPOINT = 'api-endpoint'
+  AS '/slice';
+
+CREATE OR REPLACE FUNCTION GRAGEN_DB.GRAGEN.GRAGEN_CLINVAR_SLICE(CHROM VARCHAR, START_POS INTEGER, END_POS INTEGER)
+  RETURNS VARIANT
+  SERVICE = GRAGEN_DB.GRAGEN.GRAGEN_SERVICE
+  ENDPOINT = 'api-endpoint'
+  AS '/slice_clinvar';
+
+GRANT USAGE ON FUNCTION GRAGEN_DB.GRAGEN.GRAGEN_SLICE(VARCHAR,INTEGER,INTEGER) TO ROLE PUBLIC;
+GRANT USAGE ON FUNCTION GRAGEN_DB.GRAGEN.GRAGEN_CLINVAR_SLICE(VARCHAR,INTEGER,INTEGER) TO ROLE PUBLIC;
+GRANT USAGE ON FUNCTION GRAGEN_DB.GRAGEN.GRAGEN_SLICE(VARCHAR,INTEGER,INTEGER) TO ROLE GRAGEN_DB;
+GRANT USAGE ON FUNCTION GRAGEN_DB.GRAGEN.GRAGEN_CLINVAR_SLICE(VARCHAR,INTEGER,INTEGER) TO ROLE GRAGEN_DB;
 
 -- ── Cortex Agent ─────────────────────────────────────────────────────────────
 -- Tool stored procedures called by the GENOMICS_AGENT
@@ -451,6 +466,6 @@ GRANT USAGE ON PROCEDURE GRAGEN_DB.GRAGEN.TOOL_PEDIGREE(VARCHAR) TO ROLE GRAGEN_
 SELECT 'External functions and Cortex Agent created successfully.' AS status;
 
 -- =============================================================================
--- CLINVAR_SLICE external function — DISABLED (see note above; needs a manually
--- configured SPCS service function + endpoint). The app uses /api/direct/clinvar.
+-- GRAGEN_SLICE + GRAGEN_CLINVAR_SLICE are created near the top of this file as
+-- SPCS service functions (bound to GRAGEN_SERVICE). The genome browser uses them.
 -- =============================================================================
