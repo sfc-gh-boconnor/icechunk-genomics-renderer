@@ -1,6 +1,6 @@
 import { Suspense, useEffect, useMemo, useRef, useState } from 'react'
 import { Canvas, useFrame, type ThreeEvent } from '@react-three/fiber'
-import { OrbitControls, Stars } from '@react-three/drei'
+import { OrbitControls, Stars, useTexture } from '@react-three/drei'
 import * as THREE from 'three'
 
 // Superpopulation palette (matches CohortGlobe / CohortMap)
@@ -16,7 +16,29 @@ function rgbHex([r, g, b]: [number, number, number]) {
   return `#${r.toString(16).padStart(2, '0')}${g.toString(16).padStart(2, '0')}${b.toString(16).padStart(2, '0')}`
 }
 
-type LayoutMode = 'spiral' | 'ancestry' | 'population'
+// 1000G population geographic coordinates [lon, lat] (from CohortGlobe)
+const POP_COORDS: Record<string, [number, number]> = {
+  YRI: [3.4, 6.5], LWK: [36.8, 0.4], GWD: [-15.3, 13.5], MSL: [-13.2, 8.5],
+  ESN: [8.1, 7.4], ASW: [-90.2, 29.9], ACB: [-59.5, 13.2],
+  MXL: [-116.9, 32.5], PUR: [-66.1, 18.4], CLM: [-75.5, 6.2], PEL: [-77.0, -9.2],
+  CHB: [116.4, 39.9], JPT: [139.7, 35.7], CHS: [113.3, 23.1], CDX: [100.2, 22.0], KHV: [105.8, 21.0],
+  CEU: [9.0, 47.0], TSI: [11.2, 43.8], FIN: [27.0, 65.0], GBR: [-1.5, 52.0], IBS: [-3.7, 40.4],
+  GIH: [72.9, 21.2], PJL: [74.0, 31.5], BEB: [90.4, 23.7], STU: [81.0, 8.0], ITU: [80.3, 11.1],
+}
+const GLOBE_R = 38   // family-placement sphere radius (Earth sits just inside)
+
+// lat/lon → point on a sphere of radius r (aligned with equirectangular texture)
+function latLonToVec3(lat: number, lon: number, r: number): THREE.Vector3 {
+  const phi = (90 - lat) * (Math.PI / 180)
+  const theta = (lon + 180) * (Math.PI / 180)
+  return new THREE.Vector3(
+    -r * Math.sin(phi) * Math.cos(theta),
+    r * Math.cos(phi),
+    r * Math.sin(phi) * Math.sin(theta),
+  )
+}
+
+type LayoutMode = 'spiral' | 'ancestry' | 'population' | 'globe'
 type Vec3 = [number, number, number]
 
 interface Trio {
@@ -73,6 +95,53 @@ function clusterLayout(list: Trio[], keyOf: (t: Trio) => string, order: string[]
     })
   })
   return out
+}
+
+// Globe: place each family at its population's real geographic location on a
+// sphere (Earth-textured below). Families of the same population spread on the
+// local tangent plane so they form a patch over their region.
+function globeLayout(list: Trio[]): Map<string, Vec3> {
+  const byPop = new Map<string, Trio[]>()
+  for (const t of list) {
+    const k = t.pop || 'NA'
+    if (!byPop.has(k)) byPop.set(k, [])
+    byPop.get(k)!.push(t)
+  }
+  const out = new Map<string, Vec3>()
+  const SPREAD = 0.85
+  // unknown-population families ring the south pole so they don't pile on a city
+  let naIdx = 0
+  byPop.forEach((fam, pop) => {
+    let lat: number, lon: number
+    if (POP_COORDS[pop]) { [lon, lat] = POP_COORDS[pop] }
+    else { lat = -78; lon = (naIdx++ * 31) % 360 - 180 }
+    const base = latLonToVec3(lat, lon, GLOBE_R)
+    const normal = base.clone().normalize()
+    const ref = Math.abs(normal.y) < 0.95 ? new THREE.Vector3(0, 1, 0) : new THREE.Vector3(1, 0, 0)
+    const u = new THREE.Vector3().crossVectors(ref, normal).normalize()
+    const v = new THREE.Vector3().crossVectors(normal, u).normalize()
+    fam.forEach((t, i) => {
+      const r = SPREAD * Math.sqrt(i + 0.5)
+      const th = i * GOLDEN
+      const p = base.clone()
+        .addScaledVector(u, r * Math.cos(th))
+        .addScaledVector(v, r * Math.sin(th))
+        .setLength(GLOBE_R + 0.6)           // float just above the surface
+      out.set(t.child, [p.x, p.y, p.z])
+    })
+  })
+  return out
+}
+
+// Earth — Blue Marble sphere just inside the family-placement radius.
+function Earth() {
+  const tex = useTexture('/earth-blue-marble.jpg')
+  return (
+    <mesh>
+      <sphereGeometry args={[GLOBE_R - 0.8, 64, 64]} />
+      <meshStandardMaterial map={tex} roughness={1} metalness={0} />
+    </mesh>
+  )
 }
 
 const FATHER_OFF = new THREE.Vector3(-0.42, 0.34, 0)
@@ -139,10 +208,11 @@ function FamilyGlyph({ trio, target, onHover, onPick }: {
   )
 }
 
-function ConstellationGroup({ trios, targets, spin, onHover, onPick }: {
+function ConstellationGroup({ trios, targets, spin, showEarth, onHover, onPick }: {
   trios: Trio[]
   targets: Map<string, Vec3>
   spin: boolean
+  showEarth: boolean
   onHover: (t: Trio | null) => void
   onPick: (sampleId: string) => void
 }) {
@@ -152,6 +222,7 @@ function ConstellationGroup({ trios, targets, spin, onHover, onPick }: {
   })
   return (
     <group ref={groupRef}>
+      {showEarth && <Earth />}
       {trios.map(t => (
         <FamilyGlyph key={t.child} trio={t} target={targets.get(t.child) ?? [0, 0, 0]} onHover={onHover} onPick={onPick} />
       ))}
@@ -164,12 +235,13 @@ interface Props {
 }
 
 const MODE_LABELS: Record<LayoutMode, string> = {
-  spiral: '✶ Spiral', ancestry: '🌍 By ancestry', population: '🧬 By population',
+  spiral: '✶ Spiral', ancestry: '🌍 By ancestry', population: '🧬 By population', globe: '🌐 Globe',
 }
 const MODE_HINT: Record<LayoutMode, string> = {
   spiral: 'decorative packing — distance is not meaningful',
   ancestry: 'clustered by superpopulation — distance = shared ancestry',
   population: 'clustered by 1000G population — nearby families share a population',
+  globe: 'placed at each population’s real geographic origin on the globe',
 }
 
 export function FamilyConstellation({ onPickSample }: Props) {
@@ -241,6 +313,7 @@ export function FamilyConstellation({ onPickSample }: Props) {
   const targets = useMemo(() => {
     if (mode === 'spiral') return spiralLayout(visible)
     if (mode === 'ancestry') return clusterLayout(visible, t => t.sp || 'NA', SUPERPOP_ORDER)
+    if (mode === 'globe') return globeLayout(visible)
     return clusterLayout(visible, t => t.pop || 'NA', popOrder)
   }, [visible, mode, popOrder])
 
@@ -339,7 +412,7 @@ export function FamilyConstellation({ onPickSample }: Props) {
         <Stars radius={200} depth={90} count={3500} factor={6} saturation={0.4} fade speed={0.3} />
         <fog attach="fog" args={[0x020408, 95, 200]} />
         <Suspense fallback={null}>
-          <ConstellationGroup trios={visible} targets={targets} spin={spin} onHover={setHover} onPick={onPickSample} />
+          <ConstellationGroup trios={visible} targets={targets} spin={spin} showEarth={mode === 'globe'} onHover={setHover} onPick={onPickSample} />
         </Suspense>
         <OrbitControls enableDamping dampingFactor={0.08} minDistance={6} maxDistance={170} />
       </Canvas>
