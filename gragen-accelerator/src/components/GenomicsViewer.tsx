@@ -37,20 +37,23 @@ function ChatPanel({ contextMessage, onUserMessage }: { contextMessage: { text: 
   const [input, setInput]       = useState('')
   const [loading, setLoading]   = useState(false)
   const bottomRef               = useRef<HTMLDivElement>(null)
-  const sendRef                 = useRef<(explicit?: string) => void>(() => {})
+  const sendRef                 = useRef<(explicit?: string, skipIntent?: boolean) => void>(() => {})
 
   useEffect(() => {
-    if (contextMessage) sendRef.current(contextMessage.text)
+    // Auto-injected "Explain the variant at chrN:pos" messages must NOT drive
+    // navigation intent — the chrN coordinate in the text would otherwise hijack
+    // the viewer (e.g. jump to an empty region and blank the helix). skipIntent.
+    if (contextMessage) sendRef.current(contextMessage.text, true)
   }, [contextMessage])
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [history])
 
-  const send = useCallback(async (explicit?: string) => {
+  const send = useCallback(async (explicit?: string, skipIntent?: boolean) => {
     const msg = (explicit ?? input).trim()
     if (!msg || loading) return
-    onUserMessage?.(msg)
+    if (!skipIntent) onUserMessage?.(msg)
     if (!explicit) setInput('')
     setLoading(true)
     const userMsg: ChatMessage = { role: 'user', content: msg }
