@@ -46,6 +46,7 @@ Services: `GRAGEN_DB.GRAGEN.GRAGEN_SERVICE` (backend, 8080) ·
 | `CHR22_GWAS` | DDL `sql/04_annotation_tables.sql` + `app/build_gwas_iceberg.py` | `CHROM, POSITION, TRAIT, MAPPED_GENE, RSID, RISK_ALLELE, P_VALUE` |
 | `AUTISM_GENES` (25) | `app/build_sfari_iceberg.sql` | `GENE, CHROM, START_POS, END_POS, SFARI_SCORE, NOTE` |
 | `SAMPLE_PEDIGREE` (3202) | `app/build_pedigree_iceberg.py` + `.sql` | `SAMPLE_ID, FATHER_ID, MOTHER_ID, SEX, RELATIONSHIP` — 1000G trio pedigree (father/mother links; 608 children) |
+| `SAMPLE_METRICS` (~2504, native table) | `app/build_sample_metrics.py` + PUT/COPY | `SAMPLE_ID, POPULATION, SUPERPOPULATION, SEX, MEAN_COVERAGE, …, TITV_RATIO, HET_HOM_RATIO` — cohort QC; powers **Cohort QC** + **Origins** (and `tool_cohort_query`/`tool_sample_meta`). 2500/2504 have QC; Cohort QC filters `mean_coverage IS NOT NULL`. |
 
 `CLINSIG`: `0=Benign 1=Likely benign 2=VUS 3=Likely pathogenic 4=Pathogenic 5=Conflicting 6=Other`.
 Load stage: `@GRAGEN_DB.GRAGEN.GRAGEN_LOAD_STAGE`.

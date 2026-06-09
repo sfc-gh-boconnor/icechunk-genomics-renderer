@@ -154,6 +154,9 @@ python3 app/build_clinvar_iceberg.py     # + PUT/COPY INTO CHR22_CLINVAR
 python3 app/build_gwas_iceberg.py        # + PUT/COPY INTO CHR22_GWAS
 snow sql -f app/build_sfari_iceberg.sql  -c "$GRAGEN_CONNECTION"
 python3 app/build_pedigree_iceberg.py && snow sql -f app/build_pedigree_iceberg.sql -c "$GRAGEN_CONNECTION"
+python3 app/build_sample_metrics.py      # + PUT/COPY INTO SAMPLE_METRICS (Cohort QC + Origins)
+# After the out-of-container chr22 ingest job, restart the backend so it re-opens the store:
+#   snow sql -c "$GRAGEN_CONNECTION" -q "ALTER SERVICE GRAGEN_DB.GRAGEN.GRAGEN_SERVICE SUSPEND; ALTER SERVICE GRAGEN_DB.GRAGEN.GRAGEN_SERVICE RESUME;"
 ```
 
 **5. Re-apply grants** after any service/agent recreate (see Critical Rules #6, #8–11):
@@ -376,6 +379,13 @@ hold **genome-wide** rows — they are filtered by `CHROM` + `POSITION`.)
 | `AUTISM_GENES` | 25 | `app/build_sfari_iceberg.sql` | `GENE, CHROM, START_POS, END_POS, SFARI_SCORE, NOTE` |
 | `SAMPLE_PEDIGREE` | 3202 | `app/build_pedigree_iceberg.py` (+`.sql`) | `SAMPLE_ID, FATHER_ID, MOTHER_ID, SEX, RELATIONSHIP` — 1000G trio pedigree; powers father/mother links in the sample panel |
 
+> **`SAMPLE_METRICS`** (a native table, created in `01_setup.sql.tmpl`, ~2504 rows) is loaded by
+> `app/build_sample_metrics.py` — population/superpopulation/sex (from the 30x metadata TSV) +
+> per-sample QC (coverage, Ti/Tv, dup rate, variant counts) from the public DRAGEN S3. **It powers
+> the Cohort QC scatter and the Origins globe** (both blank if it's empty). The Cohort QC query
+> filters `mean_coverage IS NOT NULL`, so the ~4 samples lacking metrics files drop out; Origins
+> counts all rows. Reproduces what was originally hand-loaded.
+
 `CLINSIG` encoding (matches frontend `CLINSIG_COLORS`): `0=Benign 1=Likely benign
 2=VUS 3=Likely pathogenic 4=Pathogenic 5=Conflicting 6=Other`.
 
@@ -399,6 +409,17 @@ python3 app/build_gwas_iceberg.py             # writes /tmp/gwas_all.csv
 
 # 3. SFARI autism genes (curated list, no external fetch — single SQL file)
 snow sql -c <CONNECTION> --warehouse GRAGEN_WH -f app/build_sfari_iceberg.sql
+
+# 4. Cohort QC metrics → SAMPLE_METRICS (populates Cohort QC + Origins)
+python3 app/build_sample_metrics.py           # writes /tmp/sample_metrics.csv (~2504 samples)
+snow sql -c <CONNECTION> --warehouse GRAGEN_WH -q "
+  PUT file:///tmp/sample_metrics.csv @GRAGEN_DB.GRAGEN.GRAGEN_LOAD_STAGE OVERWRITE=TRUE AUTO_COMPRESS=TRUE;
+  COPY INTO GRAGEN_DB.GRAGEN.SAMPLE_METRICS
+    (sample_id,population,superpopulation,sex,mean_coverage,pct_duplicates,pct_mapped,
+     total_reads,mapped_reads,dup_reads,total_variants,snp_count,ins_count,del_count,
+     titv_ratio,het_count,hom_count,het_hom_ratio)
+    FROM @GRAGEN_DB.GRAGEN.GRAGEN_LOAD_STAGE/sample_metrics.csv
+    FILE_FORMAT=(TYPE=CSV SKIP_HEADER=1 FIELD_OPTIONALLY_ENCLOSED_BY='\"' EMPTY_FIELD_AS_NULL=TRUE);"
 ```
 
 **Load pattern (CSV → Iceberg via stage):**
@@ -572,6 +593,7 @@ The agent uses `type: generic` tools backed by Python stored procedures (warehou
 
 | Version | Date | Notes |
 |---------|------|-------|
+| v1.0.33 | 2026-06-09 | Committed `app/build_sample_metrics.py` — reproducible loader for the `SAMPLE_METRICS` table (was hand-loaded before; no committed loader). Reads population/superpopulation/sex (30x metadata TSV) + per-sample QC (coverage, Ti/Tv, dup, variant counts) from public DRAGEN S3, writes CSV → PUT/COPY. Powers **Cohort QC** + **Origins** (both were blank on a fresh deploy). Fixed coverage key ("Average **sequenced** coverage over genome") + restricted parsing to the `MAPPING/ALIGNING SUMMARY` / `VARIANT CALLER POSTFILTER` sections (PER RG rows were overwriting totals). Also fixed the genome browser: recreated `GRAGEN_SLICE`/`GRAGEN_CLINVAR_SLICE` as SPCS service functions; documented backend restart after out-of-container ingest. |
 | v1.0.32 | 2026-06-09 | **Multi-SE shared-AWS provisioning.** Committed `provision_aws.sh` (prefix-parameterized): one shared S3 bucket + per-`DEPLOY_PREFIX` IAM user (`<prefix>_gragen_zarr_user`, scoped to `<prefix>/*`) + role (`<prefix>_gragen_iceberg_role`); auto-fills the AWS key/secret + `ICEBERG_ROLE_ARN` into `config.env` (secret never echoed); `--trust` phase reads the external-volume `DESC` and sets the role trust policy automatically. Model: each SE has their own Snowflake account (no Snowflake-object prefixing) but shares one AWS account (prefix isolates S3 + IAM). |
 | v1.0.31 | 2026-06-09 | **Self-contained / bring-your-own-bucket.** New `config.env` + `setup.sh` (python-rendered SQL templates) let a deployer supply their own `S3_BUCKET` + unique `DEPLOY_PREFIX` that namespaces all storage (`<prefix>/genomics_repo`, `/clinvar_repo`, `/iceberg`). `setup.sh` now **creates `GENOMICS_ICEBERG_VOLUME`** (previously never created) via `STORAGE_AWS_ROLE_ARN` + prints the IAM trust-policy gate. Secrets moved to self-contained `GRAGEN_DB.GRAGEN.AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (dropped `ICECHUNK_DB` dependency + naming bug). Added `sql/04_annotation_tables.sql` (CLINVAR/GWAS DDL + load stage). SQL files are now `.sql.tmpl`. |
 | v1.0.30 | 2026-06-09 | Trio family links (clickable father/mother in sample panel) from new `SAMPLE_PEDIGREE` Iceberg table (1000G 3,202 pedigree). Gosling tracks now fill the viewport height. Agent gains `tool_pedigree` (father/mother/children). |

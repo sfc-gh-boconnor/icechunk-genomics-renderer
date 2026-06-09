@@ -136,6 +136,21 @@ python3 app/build_clinvar_iceberg.py    # then PUT + COPY INTO CHR22_CLINVAR
 python3 app/build_gwas_iceberg.py       # then PUT + COPY INTO CHR22_GWAS
 snow sql -f app/build_sfari_iceberg.sql -c "$GRAGEN_CONNECTION"
 python3 app/build_pedigree_iceberg.py && snow sql -f app/build_pedigree_iceberg.sql -c "$GRAGEN_CONNECTION"
+
+# 8. Load cohort QC metrics (populates Cohort QC + Origins views)
+python3 app/build_sample_metrics.py     # writes /tmp/sample_metrics.csv (~2504 samples, pop/superpop/sex + QC)
+# then PUT + COPY INTO SAMPLE_METRICS (explicit column list — see below):
+snow sql -c "$GRAGEN_CONNECTION" --warehouse GRAGEN_WH -q "
+  PUT file:///tmp/sample_metrics.csv @GRAGEN_DB.GRAGEN.GRAGEN_LOAD_STAGE OVERWRITE=TRUE AUTO_COMPRESS=TRUE;
+  COPY INTO GRAGEN_DB.GRAGEN.SAMPLE_METRICS
+    (sample_id,population,superpopulation,sex,mean_coverage,pct_duplicates,pct_mapped,
+     total_reads,mapped_reads,dup_reads,total_variants,snp_count,ins_count,del_count,
+     titv_ratio,het_count,hom_count,het_hom_ratio)
+    FROM @GRAGEN_DB.GRAGEN.GRAGEN_LOAD_STAGE/sample_metrics.csv
+    FILE_FORMAT=(TYPE=CSV SKIP_HEADER=1 FIELD_OPTIONALLY_ENCLOSED_BY='\"' EMPTY_FIELD_AS_NULL=TRUE);"
+
+# 9. After any out-of-container ingest (e.g. the chr22 Zarr job), restart the backend so it
+#    re-opens the IceChunk store: ALTER SERVICE GRAGEN_DB.GRAGEN.GRAGEN_SERVICE SUSPEND; RESUME;
 ```
 
 ### Redeploy after code changes
@@ -182,6 +197,7 @@ can reproduce the entire accelerator end-to-end.
    python3 app/build_gwas_iceberg.py        # + PUT/COPY INTO CHR22_GWAS
    snow sql -f app/build_sfari_iceberg.sql  -c "$GRAGEN_CONNECTION"
    python3 app/build_pedigree_iceberg.py && snow sql -f app/build_pedigree_iceberg.sql -c "$GRAGEN_CONNECTION"
+   python3 app/build_sample_metrics.py      # + PUT/COPY INTO SAMPLE_METRICS (Cohort QC + Origins)
    ```
 5. **Re-apply grants** after any service/agent recreate (the skill's Critical Rules cover
    this): endpoint grants → `PUBLIC`; `SELECT` on Iceberg tables → `PUBLIC`/`GRAGEN_DB`;
