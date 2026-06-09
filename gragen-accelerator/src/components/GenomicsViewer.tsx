@@ -6,6 +6,7 @@ import { DataManagementPanel } from './DataManagementPanel'
 import { Variant3DView } from './Variant3DView'
 import { DNAHelix } from './DNAHelix'
 import { GoslingTracks } from './GoslingTracks'
+import { FamilyConstellation } from './FamilyConstellation'
 import DeckGL from '@deck.gl/react'
 import { ScatterplotLayer } from '@deck.gl/layers'
 import { OrthographicView } from '@deck.gl/core'
@@ -209,13 +210,14 @@ function DensityChart({ density, chrom, start, end, onRegionClick }: {
 
 // ── Main component ────────────────────────────────────────────────────────────
 
-type ViewMode = 'scatter' | 'map' | 'browser' | '3d'
+type ViewMode = 'scatter' | 'map' | 'browser' | '3d' | 'family'
 
 const VIEW_TITLES: Record<ViewMode, string> = {
   scatter: 'Cohort QC',
   map:     'Sample Origins',
   browser: 'Genome Browser',
   '3d':    '3D Genome Viewer',
+  family:  'Family Constellation',
 }
 
 interface Tooltip {
@@ -863,6 +865,7 @@ export default function GenomicsViewer({ onAgentContext }: { onAgentContext?: (m
             ['map',     '🌍', 'Origins'],
             ['browser', '🔬', 'Genome Browser'],
             ['3d',      '🧬', '3D View'],
+            ['family',  '👪', 'Families'],
           ] as [ViewMode, string, string][]).map(([v, ico, label]) => (
             <button
               key={v}
@@ -946,6 +949,38 @@ export default function GenomicsViewer({ onAgentContext }: { onAgentContext?: (m
                 <div style={{ fontSize: 10, color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 6, fontWeight: 700 }}>
                   👪 Trio — compare with parents
                 </div>
+                {/* Classic pedigree: ♂ square, ♀ circle, couple bar, sib-drop to proband */}
+                <svg viewBox="0 0 220 120" style={{ width: '100%', height: 110, marginBottom: 6 }}>
+                  {/* couple bar + sib drop */}
+                  <line x1="60" y1="34" x2="160" y2="34" stroke="var(--border)" strokeWidth="1.5" />
+                  <line x1="110" y1="34" x2="110" y2="74" stroke="var(--border)" strokeWidth="1.5" />
+                  {/* Father — square (clickable) */}
+                  {pedigree.father && (
+                    <g style={{ cursor: 'pointer' }} onClick={() => setSampleId(pedigree.father!)}>
+                      <rect x="46" y="20" width="28" height="28" rx="3" fill="var(--surface)" stroke="#3b82f6" strokeWidth="2" />
+                      <text x="60" y="62" textAnchor="middle" fontSize="8" fontFamily="monospace" fill="var(--text-secondary)">♂ {pedigree.father}</text>
+                    </g>
+                  )}
+                  {/* Mother — circle (clickable) */}
+                  {pedigree.mother && (
+                    <g style={{ cursor: 'pointer' }} onClick={() => setSampleId(pedigree.mother!)}>
+                      <circle cx="160" cy="34" r="14" fill="var(--surface)" stroke="#ec4899" strokeWidth="2" />
+                      <text x="160" y="62" textAnchor="middle" fontSize="8" fontFamily="monospace" fill="var(--text-secondary)">♀ {pedigree.mother}</text>
+                    </g>
+                  )}
+                  {/* Proband (current sample) — shape by sex, highlighted */}
+                  {(() => {
+                    const isMale = sampleMeta?.sex === '1' || sampleMeta?.sex === 'male'
+                    return (
+                      <g>
+                        {isMale
+                          ? <rect x="96" y="74" width="28" height="28" rx="3" fill="#29B5E8" stroke="#fff" strokeWidth="2" />
+                          : <circle cx="110" cy="88" r="14" fill="#29B5E8" stroke="#fff" strokeWidth="2" />}
+                        <text x="110" y="116" textAnchor="middle" fontSize="8" fontFamily="monospace" fontWeight="700" fill="var(--text-primary)">{sampleId}</text>
+                      </g>
+                    )
+                  })()}
+                </svg>
                 <div style={{ display: 'flex', gap: 6 }}>
                   {pedigree.father && (
                     <button
@@ -1231,6 +1266,15 @@ export default function GenomicsViewer({ onAgentContext }: { onAgentContext?: (m
                 endPos={endPos}
               />
             )}
+          </div>
+        )}
+
+        {/* ── Family Constellation ──────────────────────────────────────── */}
+        {view === 'family' && (
+          <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+            <FamilyConstellation
+              onPickSample={(sid) => { setSampleId(sid); setView('browser') }}
+            />
           </div>
         )}
 
