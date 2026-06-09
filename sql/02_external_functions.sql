@@ -40,6 +40,93 @@ GRANT USAGE ON FUNCTION GRAGEN_DB.GRAGEN.GRAGEN_CLINVAR_SLICE(VARCHAR,INTEGER,IN
 GRANT USAGE ON FUNCTION GRAGEN_DB.GRAGEN.GRAGEN_SLICE(VARCHAR,INTEGER,INTEGER) TO ROLE GRAGEN_DB;
 GRANT USAGE ON FUNCTION GRAGEN_DB.GRAGEN.GRAGEN_CLINVAR_SLICE(VARCHAR,INTEGER,INTEGER) TO ROLE GRAGEN_DB;
 
+-- ── SEED_CHROMOSOME: launch the out-of-container variant ingest job ──────────
+-- Called by the frontend Data Management panel (CALL SEED_CHROMOSOME('chr1')).
+-- Launches an ASYNC EXECUTE JOB SERVICE on GRAGEN_INGEST_POOL (16 workers, fast)
+-- that ingests one chromosome's 1000G VCF into the IceChunk Zarr store. Reads
+-- the deployment's bucket/prefix/region from GRAGEN_CONFIG (populated by setup.sh)
+-- so it works on any deployment. The job image is gragen-service:latest (pushed
+-- by deploy.sh). seed_job.py restarts GRAGEN_SERVICE on success (RESTART_SERVICE)
+-- so the backend re-opens the store and serves the new chromosome.
+-- Owner's-rights proc: the owner role needs CREATE SERVICE on the schema + USAGE
+-- on GRAGEN_INGEST_POOL + READ on the image repo/EAIs (ACCOUNTADMIN has these).
+CREATE OR REPLACE PROCEDURE GRAGEN_DB.GRAGEN.SEED_CHROMOSOME(CHROM VARCHAR)
+  RETURNS VARIANT
+  LANGUAGE SQL
+  EXECUTE AS OWNER
+AS
+$$
+DECLARE
+  v_chrom    VARCHAR;
+  v_bucket   VARCHAR;
+  v_prefix   VARCHAR;
+  v_region   VARCHAR;
+  v_job      VARCHAR;
+  v_stmt     VARCHAR;
+BEGIN
+  -- Normalize + validate the chromosome (chr1..chr22, chrX, chrY).
+  v_chrom := LOWER(CHROM);
+  IF (NOT v_chrom RLIKE '^chr([1-9]|1[0-9]|2[0-2]|x|y)$') THEN
+    RETURN OBJECT_CONSTRUCT('status', 'error',
+                            'message', 'Invalid chromosome: ' || CHROM);
+  END IF;
+
+  SELECT VALUE INTO v_bucket FROM GRAGEN_DB.GRAGEN.GRAGEN_CONFIG WHERE KEY = 'S3_BUCKET';
+  SELECT VALUE INTO v_prefix FROM GRAGEN_DB.GRAGEN.GRAGEN_CONFIG WHERE KEY = 'DEPLOY_PREFIX';
+  SELECT VALUE INTO v_region FROM GRAGEN_DB.GRAGEN.GRAGEN_CONFIG WHERE KEY = 'AWS_REGION';
+
+  IF (v_bucket IS NULL) THEN
+    RETURN OBJECT_CONSTRUCT('status', 'error',
+                            'message', 'GRAGEN_CONFIG not populated — re-run setup.sh');
+  END IF;
+
+  -- Unique job name per (chrom, second) so re-seeds don't collide with retained metadata.
+  v_job := 'GRAGEN_SEED_' || UPPER(REPLACE(v_chrom, 'chr', '')) || '_'
+           || TO_VARCHAR(DATE_PART('epoch_second', CURRENT_TIMESTAMP()));
+
+  v_stmt :=
+    'EXECUTE JOB SERVICE IN COMPUTE POOL GRAGEN_INGEST_POOL ' ||
+    'NAME = GRAGEN_DB.GRAGEN.' || v_job || ' ' ||
+    'ASYNC = TRUE ' ||
+    'EXTERNAL_ACCESS_INTEGRATIONS = (ICECHUNK_S3_EAI, GENOMICS_1000G_EAI) ' ||
+    'FROM SPECIFICATION ' || CHR(36) || CHR(36) || '
+spec:
+  containers:
+  - name: seed
+    image: /gragen_db/gragen/gragen_repo/gragen-service:latest
+    command: ["python3", "/app/seed_job.py"]
+    env:
+      SEED_TYPE: genomics
+      SEED_CHROMS: "' || v_chrom || '"
+      ICECHUNK_BUCKET: "' || v_bucket || '"
+      ICECHUNK_GENOMICS_PREFIX: "' || v_prefix || '/genomics_repo"
+      AWS_DEFAULT_REGION: "' || v_region || '"
+      INGEST_WORKERS: "16"
+      RESTART_SERVICE: "GRAGEN_DB.GRAGEN.GRAGEN_SERVICE"
+    secrets:
+    - snowflakeSecret:
+        objectName: GRAGEN_DB.GRAGEN.AWS_ACCESS_KEY_ID
+      envVarName: AWS_ACCESS_KEY_ID
+    - snowflakeSecret:
+        objectName: GRAGEN_DB.GRAGEN.AWS_SECRET_ACCESS_KEY
+      envVarName: AWS_SECRET_ACCESS_KEY
+' || CHR(36) || CHR(36);
+
+  EXECUTE IMMEDIATE :v_stmt;
+
+  RETURN OBJECT_CONSTRUCT(
+    'status',  'seeding',
+    'chrom',   v_chrom,
+    'job',     v_job,
+    'message', 'Ingest launched on GRAGEN_INGEST_POOL (~minutes). The backend '
+               || 'auto-restarts on completion; refresh status when done.');
+END;
+$$;
+
+GRANT USAGE ON PROCEDURE GRAGEN_DB.GRAGEN.SEED_CHROMOSOME(VARCHAR) TO ROLE PUBLIC;
+GRANT USAGE ON PROCEDURE GRAGEN_DB.GRAGEN.SEED_CHROMOSOME(VARCHAR) TO ROLE GRAGEN_DB;
+
+
 -- ── Cortex Agent ─────────────────────────────────────────────────────────────
 -- Tool stored procedures called by the GENOMICS_AGENT
 

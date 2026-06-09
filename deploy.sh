@@ -93,9 +93,10 @@ snow spcs image-registry login -c "$CONNECTION"
 if $DEPLOY_BACKEND; then
   echo ">>> Building gragen-service:${SERVICE_VERSION}…"
   docker buildx build --platform linux/amd64 \
-    -t "${REGISTRY}/gragen-service:${SERVICE_VERSION}" --push \
+    -t "${REGISTRY}/gragen-service:${SERVICE_VERSION}" \
+    -t "${REGISTRY}/gragen-service:latest" --push \
     -f "${SCRIPT_DIR}/Dockerfile" "${SCRIPT_DIR}/"
-  echo ">>> gragen-service image pushed."
+  echo ">>> gragen-service image pushed (${SERVICE_VERSION} + latest)."
 fi
 
 # ── Build + push frontend ─────────────────────────────────────────────────────

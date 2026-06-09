@@ -343,19 +343,40 @@ curl https://<URL>/api/direct/clinvar \
 
 ### Step 7: (Optional) Seed more chromosomes
 
+**Easiest: from the app UI.** The **Data Management** panel (in the left sidebar of the
+genome browser) lists every chromosome with its Zarr load status and a **⬇ Seed** button
+for any not yet loaded. Clicking it runs `CALL GRAGEN_DB.GRAGEN.SEED_CHROMOSOME('chrN')`,
+which launches an **async out-of-container ingest job** on `GRAGEN_INGEST_POOL` (16 workers,
+`gragen-service:latest`). The job ingests that chromosome's 1000G VCF into the Zarr store and
+**auto-restarts the backend** on completion (so it re-opens the store and serves the new data).
+Click **↻ Refresh Status** after a few minutes. How it fits together:
+
+- `SEED_CHROMOSOME(CHROM)` (in `sql/02`) reads bucket/prefix/region from the `GRAGEN_CONFIG`
+  table (populated by `setup.sh`) and builds the `EXECUTE JOB SERVICE … ASYNC=TRUE` spec.
+- `deploy.sh` pushes the backend as both `:<version>` **and `:latest`** so the job always runs
+  the current image.
+- `seed_job.py` restarts `RESTART_SERVICE` (the backend) via the SPCS session token when the
+  genomics ingest succeeds — the cached repo handle in the running backend does **not** see
+  commits made by the out-of-container job, so a SUSPEND/RESUME is required.
+- The panel reads Zarr status from `/api/meta` (`chromosomes_in_store`); genome variants are
+  Zarr-only (there is no per-chromosome Iceberg table), so there is no "cache to Iceberg" step.
+
+**Programmatic alternatives** (equivalent, for scripting):
+
 ```bash
-# Seed all autosomes + X for 1000G:
+# One chromosome via the stored proc (async, 16-worker pool — same as the UI button):
+snow sql -c "$GRAGEN_CONNECTION" -q "CALL GRAGEN_DB.GRAGEN.SEED_CHROMOSOME('chr1')"
+
+# Whole-genome batch via the committed job template (single job, all chroms):
+snow sql -c "$GRAGEN_CONNECTION" -f sql/_rendered/run_genome_ingest_job.sql
+
+# In-container (single-threaded, slow — fine for one small chrom, no pool needed):
 curl -X POST https://<URL>/api/direct/seed_genomics \
   -d '{"chroms": ["chr1","chr2","chr3","chr4","chr5","chr6","chr7",
        "chr8","chr9","chr10","chr11","chr12","chr13","chr14","chr15",
        "chr16","chr17","chr18","chr19","chr20","chr21","chrX"]}'
-
-# Seed all chromosomes for ClinVar (~30 min for full genome):
-curl -X POST https://<URL>/api/direct/seed_clinvar \
-  -d '{"chroms": ["chr1","chr2","chr3","chr4","chr5","chr6","chr7",
-       "chr8","chr9","chr10","chr11","chr12","chr13","chr14","chr15",
-       "chr16","chr17","chr18","chr19","chr20","chr21","chr22","chrX"]}'
 ```
+
 
 ---
 
@@ -602,6 +623,7 @@ The agent uses `type: generic` tools backed by Python stored procedures (warehou
 
 | Version | Date | Notes |
 |---------|------|-------|
+| v1.0.38 | 2026-06-09 | **In-UI chromosome loader now works end-to-end.** The Data Management panel was wired to objects that were never created (`GRAGEN_SEED_GENOMICS`, `MATERIALIZE_ICEBERG_TABLES`, `CHR22_VARIANTS`, `GRAGEN_META`) → every action errored. Replaced with a real path: new `SEED_CHROMOSOME(CHROM)` stored proc (`sql/02`) launches an async `EXECUTE JOB SERVICE` on `GRAGEN_INGEST_POOL` (16 workers, `gragen-service:latest`); reads bucket/prefix/region from new `GRAGEN_CONFIG` table (`sql/01`, populated by setup.sh); `deploy.sh` now also pushes the backend `:latest`; `seed_job.py` auto-restarts the backend (`RESTART_SERVICE`) on success so it re-opens the Zarr store. Panel rewritten to read Zarr status from `/api/meta` and dropped the obsolete Iceberg-materialization + ClinVar-refresh controls (genomes are Zarr-only). Validated on FSI: chr21 ingest launched + ran with 16 workers. |
 | v1.0.37 | 2026-06-09 | **Committed `preflight.sh`** — prerequisite check that fails fast before any deploy. Verifies the `snow`/`docker`(+buildx+running daemon)/`aws`/`python3` CLIs, `config.env` presence + required vars + valid `DEPLOY_PREFIX`, a working Snowflake connection whose active role is ACCOUNTADMIN, AWS CLI authentication (`sts get-caller-identity`), and **region colocation** (`CURRENT_REGION()` vs `AWS_REGION`, the slow-ingest trap). `--no-aws` / `--no-docker` flags + `GRAGEN_SKIP_PREFLIGHT=1` override. Auto-invoked by `setup.sh` (`--no-aws --no-docker`), `provision_aws.sh` (`--no-docker`), and `deploy.sh` (`--no-aws`). |
 | v1.0.36 | 2026-06-09 | Fixed backend `direct_metrics` (Cohort QC + Origins) — same coverage-key + `MAPPING/ALIGNING SUMMARY` / `VARIANT CALLER POSTFILTER` section-filter fix as the offline loader; rebuilt + redeployed `gragen-service`. |
 | v1.0.33 | 2026-06-09 | Committed `app/build_sample_metrics.py` — reproducible loader for the `SAMPLE_METRICS` table (was hand-loaded before; no committed loader). Reads population/superpopulation/sex (30x metadata TSV) + per-sample QC (coverage, Ti/Tv, dup, variant counts) from public DRAGEN S3, writes CSV → PUT/COPY. Powers **Cohort QC** + **Origins** (both were blank on a fresh deploy). Fixed coverage key ("Average **sequenced** coverage over genome") + restricted parsing to the `MAPPING/ALIGNING SUMMARY` / `VARIANT CALLER POSTFILTER` sections (PER RG rows were overwriting totals). Also fixed the genome browser: recreated `GRAGEN_SLICE`/`GRAGEN_CLINVAR_SLICE` as SPCS service functions; documented backend restart after out-of-container ingest. |

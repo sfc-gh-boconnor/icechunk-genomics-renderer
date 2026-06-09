@@ -145,6 +145,21 @@ CREATE TABLE IF NOT EXISTS GRAGEN_DB.GRAGEN.SAMPLE_METRICS (
   PRIMARY KEY (sample_id)
 );
 
+-- ── Deployment config (read by SEED_CHROMOSOME to build the ingest job spec) ──
+-- Holds this deployment's bucket / prefix / region so the stored proc can
+-- launch EXECUTE JOB SERVICE without itself being a rendered template.
+CREATE TABLE IF NOT EXISTS GRAGEN_DB.GRAGEN.GRAGEN_CONFIG (
+  KEY    VARCHAR NOT NULL,
+  VALUE  VARCHAR,
+  PRIMARY KEY (KEY)
+);
+DELETE FROM GRAGEN_DB.GRAGEN.GRAGEN_CONFIG
+  WHERE KEY IN ('S3_BUCKET', 'DEPLOY_PREFIX', 'AWS_REGION');
+INSERT INTO GRAGEN_DB.GRAGEN.GRAGEN_CONFIG (KEY, VALUE) VALUES
+  ('S3_BUCKET',     '${S3_BUCKET}'),
+  ('DEPLOY_PREFIX', '${DEPLOY_PREFIX}'),
+  ('AWS_REGION',    '${AWS_REGION}');
+
 -- =============================================================================
 -- Role + User setup
 -- =============================================================================

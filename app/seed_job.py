@@ -28,6 +28,51 @@ workers   = int(os.environ.get("INGEST_WORKERS", "8"))
 
 logger.info(f"=== GRAGEN Seed Job: type={seed_type}, chroms={chroms}, workers={workers} ===")
 
+
+def _restart_backend_service():
+    """Best-effort: restart the backend so it re-opens the IceChunk store and
+    serves the newly-ingested chromosome. The cached repo handle in the running
+    backend does NOT see commits made by this out-of-container job, so a
+    SUSPEND/RESUME is required. Controlled by the RESTART_SERVICE env var
+    (set by the SEED_CHROMOSOME stored proc)."""
+    svc = os.environ.get("RESTART_SERVICE")
+    if not svc:
+        return
+    try:
+        import snowflake.connector
+        token_path = "/snowflake/session/token"
+        if not os.path.exists(token_path):
+            logger.warning("[restart] No SPCS token; skipping backend restart.")
+            return
+        with open(token_path) as f:
+            token = f.read().strip()
+        kwargs = dict(
+            account       = os.environ.get("SNOWFLAKE_ACCOUNT"),
+            authenticator = "oauth",
+            token         = token,
+            database      = os.environ.get("SNOWFLAKE_DB", "GRAGEN_DB"),
+            schema        = os.environ.get("SNOWFLAKE_SCHEMA", "GRAGEN"),
+        )
+        host = os.environ.get("SNOWFLAKE_HOST")
+        if host:
+            kwargs["host"] = host
+        role = os.environ.get("SNOWFLAKE_ROLE")
+        if role:
+            kwargs["role"] = role
+        logger.info(f"[restart] Restarting backend service {svc}…")
+        conn = snowflake.connector.connect(**kwargs)
+        try:
+            cur = conn.cursor()
+            cur.execute(f"ALTER SERVICE {svc} SUSPEND")
+            cur.execute(f"ALTER SERVICE {svc} RESUME")
+            logger.info(f"[restart] {svc} suspended + resumed.")
+        finally:
+            conn.close()
+    except Exception:
+        logger.exception("[restart] Backend restart failed (non-fatal). "
+                          "Restart it manually: ALTER SERVICE … SUSPEND; RESUME.")
+
+
 try:
     if seed_type == "clinvar":
         from ingest_clinvar import ingest_clinvar
@@ -69,6 +114,13 @@ try:
         result = ingest_genomics(chroms=chroms, max_workers=workers)
 
     logger.info(f"=== Seed complete: {json.dumps(result, default=str)} ===")
+
+    # Genomics ingest changed the Zarr store the backend serves → restart it so
+    # the cached repo handle re-opens at the new snapshot (no-op if unset).
+    if seed_type in ("genomics", "clinvar") or seed_type not in (
+            "iceberg", "iceberg_genomics", "iceberg_clinvar", "iceberg_all"):
+        _restart_backend_service()
+
     sys.exit(0)
 except Exception:
     logger.exception("=== Seed FAILED ===")
