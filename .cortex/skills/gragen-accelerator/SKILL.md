@@ -502,11 +502,16 @@ The agent uses `type: generic` tools backed by Python stored procedures (warehou
 | `tool_find_outliers` | `TOOL_FIND_OUTLIERS` | top/bottom samples by metric |
 | `tool_query_annotations` | `TOOL_QUERY_ANNOTATIONS` | ClinVar/GWAS/SFARI by region, gene, or summary |
 | `tool_pedigree` | `TOOL_PEDIGREE` | trio father/mother/children for a sample |
+| `tool_cohort_variants` | `TOOL_COHORT_VARIANTS` | **cohort allele frequency joined to annotations** — reads per-position `allele_freq` from the Zarr store via `GRAGEN_SLICE` and merges with ClinVar/GWAS on `(CHROM, POSITION)`. Gene or chrom+start+end; region capped 2 Mb. No materialization (genomes stay in Zarr). |
 
 > **Gotcha:** Snowpark `Row` → use `row.as_dict()`, not `dict(row)` (else "dictionary update
 > sequence element"). `CREATE OR REPLACE AGENT` **drops all grants** — re-grant `USAGE ON AGENT`
 >           + every tool procedure to `GRAGEN_DB`, `GRAGEN_DB_ROLE`, `SYSADMIN` (the frontend
 > service identity), or the agent API returns 401.
+>
+> **`tool_cohort_variants` depends on the backend service** — it calls the `GRAGEN_SLICE`
+> service function, so `GRAGEN_SERVICE` must be READY (and `GRAGEN_SLICE` granted to the agent's
+> role) or the tool returns "Cohort store unavailable".
 
 ### Origins globe + theme
 
@@ -623,6 +628,7 @@ The agent uses `type: generic` tools backed by Python stored procedures (warehou
 
 | Version | Date | Notes |
 |---------|------|-------|
+| v1.0.39 | 2026-06-09 | **Agent gains cohort allele frequency + annotation joins.** New `tool_cohort_variants` (`TOOL_COHORT_VARIANTS` proc) reads per-position cohort `allele_freq` from the Zarr store via the `GRAGEN_SLICE` service function and merges it with ClinVar/GWAS on `(CHROM, POSITION)` — answering "allele frequency at pathogenic ClinVar sites in <gene/region>". No `CHR22_VARIANTS` materialization (genomes stay in Zarr); region capped 2 Mb. SQL-only change — re-run `sql/02` (recreates procs + agent + grants), no image rebuild. Validated on FSI: proc + gene mode work, and the agent calls the tool end-to-end (SHANK3: 500 ClinVar sites, 68 with cohort AF, mean 0.51%). The join key was never missing — it's the genomic coordinate, already on every annotation table + Zarr `position`. |
 | v1.0.38 | 2026-06-09 | **In-UI chromosome loader now works end-to-end.** The Data Management panel was wired to objects that were never created (`GRAGEN_SEED_GENOMICS`, `MATERIALIZE_ICEBERG_TABLES`, `CHR22_VARIANTS`, `GRAGEN_META`) → every action errored. Replaced with a real path: new `SEED_CHROMOSOME(CHROM)` stored proc (`sql/02`) launches an async `EXECUTE JOB SERVICE` on `GRAGEN_INGEST_POOL` (16 workers, `gragen-service:latest`); reads bucket/prefix/region from new `GRAGEN_CONFIG` table (`sql/01`, populated by setup.sh); `deploy.sh` now also pushes the backend `:latest`; `seed_job.py` auto-restarts the backend (`RESTART_SERVICE`) on success so it re-opens the Zarr store. Panel rewritten to read Zarr status from `/api/meta` and dropped the obsolete Iceberg-materialization + ClinVar-refresh controls (genomes are Zarr-only). Validated on FSI: chr21 ingest launched + ran with 16 workers. |
 | v1.0.37 | 2026-06-09 | **Committed `preflight.sh`** — prerequisite check that fails fast before any deploy. Verifies the `snow`/`docker`(+buildx+running daemon)/`aws`/`python3` CLIs, `config.env` presence + required vars + valid `DEPLOY_PREFIX`, a working Snowflake connection whose active role is ACCOUNTADMIN, AWS CLI authentication (`sts get-caller-identity`), and **region colocation** (`CURRENT_REGION()` vs `AWS_REGION`, the slow-ingest trap). `--no-aws` / `--no-docker` flags + `GRAGEN_SKIP_PREFLIGHT=1` override. Auto-invoked by `setup.sh` (`--no-aws --no-docker`), `provision_aws.sh` (`--no-docker`), and `deploy.sh` (`--no-aws`). |
 | v1.0.36 | 2026-06-09 | Fixed backend `direct_metrics` (Cohort QC + Origins) — same coverage-key + `MAPPING/ALIGNING SUMMARY` / `VARIANT CALLER POSTFILTER` section-filter fix as the offline loader; rebuilt + redeployed `gragen-service`. |
