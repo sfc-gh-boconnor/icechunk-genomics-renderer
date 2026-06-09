@@ -99,6 +99,35 @@ missing and reuses it otherwise.
 
 ---
 
+## Build it all with Cortex Code (CoCo) — recommended
+
+The whole accelerator can be built **conversationally** in [Cortex Code](https://docs.snowflake.com/en/user-guide/cortex-code/cortex-code). The repo ships a skill (`.cortex/skills/gragen-accelerator/SKILL.md`) that is the complete deployment playbook — CoCo loads it automatically and drives every step, asking you for input only where a human decision is needed (your prefix/bucket, the IAM trust loop, which chromosomes to seed).
+
+```bash
+git clone <this-repo> && cd ICECHUNK_GENOMICS
+coco                       # launch Cortex Code in the repo root (skill auto-discovered)
+```
+
+Then just talk to it. A typical end-to-end session:
+
+| You say to CoCo | What CoCo does (via the skill) |
+|-----------------|--------------------------------|
+| *"Check my prerequisites for deploying GRAGEN"* | Runs `preflight.sh` — verifies `snow`/Docker/`buildx`/AWS CLIs, your connection + **ACCOUNTADMIN** role, AWS auth, and **region colocation**; fails fast with fixes. |
+| *"Deploy the GRAGEN accelerator end to end"* | Walks Steps 0–9: confirms `config.env` (prefix/bucket/region/connection) → `provision_aws.sh` (shared bucket + prefixed IAM user/role) → `setup.sh` (external volume + secrets) → `provision_aws.sh --trust` (closes the IAM trust loop from the volume DESC) → builds + pushes images → deploys both SPCS services → prints the **live app URL**. |
+| *"Seed chr22 and ClinVar into the IceChunk store"* | Triggers the in-app loader / `SEED_CHROMOSOME('chr22')` async job, then restarts the backend so it re-opens the Zarr store. |
+| *"Create the agent and load the annotation + pedigree tables"* | Runs `sql/02_external_functions.sql` (`GENOMICS_AGENT` + tools incl. `tool_cohort_variants`), `sql/04_annotation_tables.sql`, the ClinVar/GWAS/SFARI/pedigree builders, and `build_sample_metrics.py` (Cohort QC + Origins), then **re-applies grants**. |
+| *"Load chromosome 21 as well"* | Uses the Data Management panel / `SEED_CHROMOSOME('chr21')` ingest job (16 workers) and restarts the backend. |
+| *"Redeploy just the frontend"* | Bumps `VERSION` and runs `deploy.sh --accel-only`, then verifies the service is `READY` on the new image. |
+| *"Something's broken — debug it"* | Pulls `SYSTEM$GET_SERVICE_STATUS` / `GET_SERVICE_LOGS`, checks image tags, and works the skill's troubleshooting + critical-rules sections. |
+
+CoCo can also **verify visually** — ask it to *"open the app and screenshot the Family Constellation globe"* and it will drive the browser to confirm the build.
+
+> **Tip:** keep everything reproducible by letting CoCo do the version bumps and grant re-applies — the skill encodes the gotchas (e.g. `CREATE OR REPLACE AGENT` drops grants; `SAMPLE_METRICS` holds only the 2,504 unrelated samples). To share the skill with teammates, run `/share-skill` in CoCo.
+
+The manual / scripted equivalent of every step is below.
+
+---
+
 ## Quick start
 
 > Prerequisites: `snow` CLI authenticated to your own Snowflake account with a credential that
