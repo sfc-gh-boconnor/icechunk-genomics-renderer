@@ -263,6 +263,22 @@ export default function GenomicsViewer({ onAgentContext }: { onAgentContext?: (m
   const [varTooltip, setVarTooltip] = useState<Tooltip | null>(null)
   const [sampleMeta, setSampleMeta] = useState<SampleMetrics | null>(null)
   const [pedigree, setPedigree] = useState<{ father?: string; mother?: string } | null>(null)
+  const [acct, setAcct] = useState<string | null>(null)
+
+  // Dynamic account label for the footer (no hardcoded connection name).
+  useEffect(() => {
+    fetch('/api/query', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sql: 'SELECT CURRENT_ACCOUNT() AS A', database: 'GRAGEN_DB', schema: 'GRAGEN' }),
+    })
+      .then(r => r.json())
+      .then((j: { data?: Record<string, unknown>[] }) => {
+        const a = j.data?.[0]
+        const v = a ? (a.A ?? a.a) : null
+        if (v != null) setAcct(String(v))
+      })
+      .catch(() => { /* leave null */ })
+  }, [])
 
   // ── Save to table state ───────────────────────────────────────────────────
   const [tableName,  setTableName]  = useState('')
@@ -1120,7 +1136,7 @@ export default function GenomicsViewer({ onAgentContext }: { onAgentContext?: (m
 
         <div className="sidebar-footer">
           <div className="ctx"><span className="status-dot green" /> GRAGEN_DB.GRAGEN</div>
-          <div className="sub">internal-marketplace{meta?.sample_count != null ? ` · ${meta.sample_count.toLocaleString()} samples` : ''}</div>
+          <div className="sub">{acct ?? 'Snowflake'}{meta?.sample_count != null ? ` · ${meta.sample_count.toLocaleString()} samples` : ''}</div>
         </div>
       </aside>
 

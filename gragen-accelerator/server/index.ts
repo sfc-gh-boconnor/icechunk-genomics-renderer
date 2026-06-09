@@ -137,7 +137,7 @@ async function snowSqlSpcs(
 function snowSqlLocal(sql: string, database?: string, schema?: string): unknown[] {
   const db  = (database ?? SF_DATABASE).replace(/[^A-Za-z0-9_]/g, '')
   const sch = (schema   ?? SF_SCHEMA  ).replace(/[^A-Za-z0-9_]/g, '')
-  const result = spawnSync('snow', ['sql', '-c', 'internal-marketplace', '-q', sql, '--database', db, '--schema', sch, '--format', 'json'], { encoding: 'utf8', maxBuffer: 50 * 1024 * 1024 })
+  const result = spawnSync('snow', ['sql', '-c', process.env.GRAGEN_CONNECTION || 'internal-marketplace', '-q', sql, '--database', db, '--schema', sch, '--format', 'json'], { encoding: 'utf8', maxBuffer: 50 * 1024 * 1024 })
   if (result.error) throw result.error
   if (result.status !== 0) throw new Error(result.stderr || result.stdout || 'snow sql failed')
   const out = result.stdout?.trim()
@@ -269,24 +269,36 @@ app.post('/api/direct/variants', async (req: Request, res: Response) => {
 })
 
 app.post('/api/direct/clinvar', async (req: Request, res: Response) => {
-  // Use SQL service function instead of direct HTTP
+  // ClinVar genome-browser track reads the CHR22_CLINVAR Iceberg table (single
+  // source of truth, shared with the 3D helix overlay). The legacy clinvar_repo
+  // Zarr store + GRAGEN_CLINVAR_SLICE are no longer used.
   const { chrom = 'chr22', start = 20900000, end = 21100000 } = (req.body ?? {}) as Record<string, unknown>
+  const CLINSIG_LABELS: Record<number, string> = {
+    0: 'Benign', 1: 'Likely benign', 2: 'VUS', 3: 'Likely pathogenic',
+    4: 'Pathogenic', 5: 'Conflicting', 6: 'Other',
+  }
   try {
-    const sql = `SELECT GRAGEN_DB.GRAGEN.GRAGEN_CLINVAR_SLICE(
-      '${String(chrom)}', ${Number(start)}, ${Number(end)}
-    ) AS result`
+    const sql = `SELECT POSITION, CLINSIG, REVSTAT, ALLELE_ID, DISEASE, GENE
+                   FROM GRAGEN_DB.GRAGEN.CHR22_CLINVAR
+                  WHERE CHROM='${String(chrom).replace(/'/g, "''")}'
+                    AND POSITION BETWEEN ${Number(start)} AND ${Number(end)}
+                  ORDER BY POSITION
+                  LIMIT 20000`
     const rows = await runSql(sql, 'GRAGEN_DB', 'GRAGEN')
-    const raw = rows[0] as Record<string, unknown>
-    let result = raw['RESULT'] ?? raw['result']
-    if (typeof result === 'string') { try { result = JSON.parse(result) } catch { /* keep */ } }
-    const r = (result ?? {}) as Record<string, unknown>
-    res.json({
-      chrom:    r['chrom']     ?? chrom,
-      start:    r['start']     ?? start,
-      end:      r['end']       ?? end,
-      count:    r['row_count'] ?? 0,
-      variants: r['data']      ?? [],
+    const variants = rows.map(row => {
+      const r = row as Record<string, unknown>
+      const sig = Number(r['CLINSIG'] ?? r['clinsig'] ?? 6)
+      return {
+        pos:           Number(r['POSITION'] ?? r['position']),
+        clinsig:       sig,
+        clinsig_label: CLINSIG_LABELS[sig] ?? 'Other',
+        revstat:       Number(r['REVSTAT'] ?? r['revstat'] ?? 0),
+        allele_id:     Number(r['ALLELE_ID'] ?? r['allele_id'] ?? 0),
+        disease:       String(r['DISEASE'] ?? r['disease'] ?? ''),
+        gene:          String(r['GENE'] ?? r['gene'] ?? ''),
+      }
     })
+    res.json({ chrom, start, end, count: variants.length, variants })
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
     console.error('[clinvar] SQL error:', msg)
