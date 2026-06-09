@@ -80,6 +80,14 @@ Snowflake:
 
 ## Prerequisites
 
+> **Run `bash preflight.sh` first.** It verifies every prerequisite below and fails fast with
+> actionable messages: the `snow`/`docker`(+buildx+daemon)/`aws`/`python3` CLIs, a filled-in
+> `config.env` with a valid `DEPLOY_PREFIX`, a working Snowflake connection whose active role is
+> ACCOUNTADMIN, AWS CLI authentication, and **region colocation** (Snowflake account region ==
+> `AWS_REGION`). `setup.sh`, `provision_aws.sh`, and `deploy.sh` each auto-run the relevant subset
+> at startup (`provision`→AWS, `deploy`→Docker, `setup`→neither). Override with
+> `GRAGEN_SKIP_PREFLIGHT=1`. Flags: `--no-aws`, `--no-docker`.
+
 - `snow` CLI authenticated: `snow connection test -c <CONNECTION>`
 - **The connection's Snowflake credential must allow multi-role access including ACCOUNTADMIN.**
   If using a programmatic access token (PAT), create it with **multiple roles** (not bound to a
@@ -191,6 +199,7 @@ Step 7: (Optional) Seed more chromosomes / load SAMPLE_METRICS
 
 ```bash
 cp config.env.example config.env     # edit DEPLOY_PREFIX, S3_BUCKET, AWS_REGION, GRAGEN_CONNECTION
+bash preflight.sh                    # verify CLIs, connection, AWS auth, region colocation (fails fast)
 bash provision_aws.sh                # shared bucket (if missing) + <prefix>_gragen_zarr_user / _iceberg_role
                                      #   -> writes the IAM-user key + ICEBERG_ROLE_ARN into config.env
 bash setup.sh                        # renders sql/*.tmpl, creates DB/pool/EAIs/secrets + GENOMICS_ICEBERG_VOLUME
@@ -593,6 +602,8 @@ The agent uses `type: generic` tools backed by Python stored procedures (warehou
 
 | Version | Date | Notes |
 |---------|------|-------|
+| v1.0.37 | 2026-06-09 | **Committed `preflight.sh`** — prerequisite check that fails fast before any deploy. Verifies the `snow`/`docker`(+buildx+running daemon)/`aws`/`python3` CLIs, `config.env` presence + required vars + valid `DEPLOY_PREFIX`, a working Snowflake connection whose active role is ACCOUNTADMIN, AWS CLI authentication (`sts get-caller-identity`), and **region colocation** (`CURRENT_REGION()` vs `AWS_REGION`, the slow-ingest trap). `--no-aws` / `--no-docker` flags + `GRAGEN_SKIP_PREFLIGHT=1` override. Auto-invoked by `setup.sh` (`--no-aws --no-docker`), `provision_aws.sh` (`--no-docker`), and `deploy.sh` (`--no-aws`). |
+| v1.0.36 | 2026-06-09 | Fixed backend `direct_metrics` (Cohort QC + Origins) — same coverage-key + `MAPPING/ALIGNING SUMMARY` / `VARIANT CALLER POSTFILTER` section-filter fix as the offline loader; rebuilt + redeployed `gragen-service`. |
 | v1.0.33 | 2026-06-09 | Committed `app/build_sample_metrics.py` — reproducible loader for the `SAMPLE_METRICS` table (was hand-loaded before; no committed loader). Reads population/superpopulation/sex (30x metadata TSV) + per-sample QC (coverage, Ti/Tv, dup, variant counts) from public DRAGEN S3, writes CSV → PUT/COPY. Powers **Cohort QC** + **Origins** (both were blank on a fresh deploy). Fixed coverage key ("Average **sequenced** coverage over genome") + restricted parsing to the `MAPPING/ALIGNING SUMMARY` / `VARIANT CALLER POSTFILTER` sections (PER RG rows were overwriting totals). Also fixed the genome browser: recreated `GRAGEN_SLICE`/`GRAGEN_CLINVAR_SLICE` as SPCS service functions; documented backend restart after out-of-container ingest. |
 | v1.0.32 | 2026-06-09 | **Multi-SE shared-AWS provisioning.** Committed `provision_aws.sh` (prefix-parameterized): one shared S3 bucket + per-`DEPLOY_PREFIX` IAM user (`<prefix>_gragen_zarr_user`, scoped to `<prefix>/*`) + role (`<prefix>_gragen_iceberg_role`); auto-fills the AWS key/secret + `ICEBERG_ROLE_ARN` into `config.env` (secret never echoed); `--trust` phase reads the external-volume `DESC` and sets the role trust policy automatically. Model: each SE has their own Snowflake account (no Snowflake-object prefixing) but shares one AWS account (prefix isolates S3 + IAM). |
 | v1.0.31 | 2026-06-09 | **Self-contained / bring-your-own-bucket.** New `config.env` + `setup.sh` (python-rendered SQL templates) let a deployer supply their own `S3_BUCKET` + unique `DEPLOY_PREFIX` that namespaces all storage (`<prefix>/genomics_repo`, `/clinvar_repo`, `/iceberg`). `setup.sh` now **creates `GENOMICS_ICEBERG_VOLUME`** (previously never created) via `STORAGE_AWS_ROLE_ARN` + prints the IAM trust-policy gate. Secrets moved to self-contained `GRAGEN_DB.GRAGEN.AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (dropped `ICECHUNK_DB` dependency + naming bug). Added `sql/04_annotation_tables.sql` (CLINVAR/GWAS DDL + load stage). SQL files are now `.sql.tmpl`. |

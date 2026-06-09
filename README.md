@@ -106,10 +106,16 @@ missing and reuses it otherwise.
 > `USE ROLE` and can't create EAIs / the external volume), Docker with `buildx`, and AWS CLI
 > authenticated against the shared AWS account (env vars / SSO / profile) with permission to
 > create an S3 bucket + IAM user/role. Full detail is in the skill.
+>
+> Run **`bash preflight.sh`** first — it verifies all of the above (CLIs, connection + ACCOUNTADMIN
+> role, AWS auth, Docker daemon/buildx) plus **region colocation** (Snowflake region must match
+> `AWS_REGION`) and fails fast with clear messages. `setup.sh` / `provision_aws.sh` / `deploy.sh`
+> auto-run the relevant subset.
 
 ```bash
 # 0. Configure: pick a unique prefix + the shared bucket/region (creds auto-filled later)
 cp config.env.example config.env        # edit DEPLOY_PREFIX, S3_BUCKET, AWS_REGION, GRAGEN_CONNECTION
+bash preflight.sh                       # verify prerequisites (fails fast)
 
 # 1. Provision AWS (shared bucket + your prefixed IAM user/role). Writes the IAM-user
 #    key + ICEBERG_ROLE_ARN back into config.env automatically.

@@ -14,6 +14,15 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# ── Preflight: verify prerequisites (Docker required for builds) ──────────────
+# Set GRAGEN_SKIP_PREFLIGHT=1 to bypass.
+if [[ "${GRAGEN_SKIP_PREFLIGHT:-0}" != "1" && -f "${SCRIPT_DIR}/preflight.sh" ]]; then
+  bash "${SCRIPT_DIR}/preflight.sh" --no-aws || {
+    echo "Preflight failed. Fix the items above, or set GRAGEN_SKIP_PREFLIGHT=1 to override." >&2
+    exit 1
+  }
+fi
+
 # ── Load deployment config (bucket / prefix / region) ─────────────────────────
 if [[ -f "${SCRIPT_DIR}/config.env" ]]; then
   # shellcheck disable=SC1090

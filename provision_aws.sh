@@ -38,6 +38,14 @@ fi
 : "${DEPLOY_PREFIX:?set in config.env}"
 : "${S3_BUCKET:?set in config.env}"
 : "${AWS_REGION:?set in config.env}"
+
+# ── Preflight: AWS auth + config required here (Docker not needed) ─────────────
+if [[ "${GRAGEN_SKIP_PREFLIGHT:-0}" != "1" && -f ./preflight.sh ]]; then
+  bash ./preflight.sh --no-docker || {
+    echo "Preflight failed. Fix the items above, or set GRAGEN_SKIP_PREFLIGHT=1 to override." >&2
+    exit 1
+  }
+fi
 : "${GRAGEN_CONNECTION:?set in config.env}"
 
 if [[ ! "$DEPLOY_PREFIX" =~ ^[a-z0-9_]+$ ]]; then
