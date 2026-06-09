@@ -30,19 +30,23 @@ interface Trio {
 
 const GOLDEN = Math.PI * (3 - Math.sqrt(5))
 
-// Decorative single spiral (no meaning — packs densely).
+const FAMILY_C = 0.95   // intra-cluster family spacing constant
+
+// Decorative single spiral (no meaning — packs densely). Spaced so the whole
+// cloud fills roughly the same extent as the clustered grids below.
 function spiralLayout(list: Trio[]): Map<string, Vec3> {
   const out = new Map<string, Vec3>()
   list.forEach((t, i) => {
-    const r = 1.25 * Math.sqrt(i + 0.5)
+    const r = 1.7 * Math.sqrt(i + 0.5)
     const th = i * GOLDEN
-    out.set(t.child, [r * Math.cos(th), r * Math.sin(th), Math.sin(i * 0.7) * 1.4])
+    out.set(t.child, [r * Math.cos(th), r * Math.sin(th), Math.sin(i * 0.7) * 1.2])
   })
   return out
 }
 
-// Grouped "islands": one cluster per group on a ring, families on a local
-// spiral inside each. Distance now means shared group (ancestry / population).
+// Grouped "islands": one cluster per group, laid out on a centered grid (fills
+// the viewport with no empty hole), families on a local spiral inside each.
+// Distance now means shared group (ancestry / population).
 function clusterLayout(list: Trio[], keyOf: (t: Trio) => string, order: string[]): Map<string, Vec3> {
   const groups = new Map<string, Trio[]>()
   for (const t of list) {
@@ -52,16 +56,18 @@ function clusterLayout(list: Trio[], keyOf: (t: Trio) => string, order: string[]
   }
   const keys = order.filter(k => groups.has(k))
   for (const k of groups.keys()) if (!keys.includes(k)) keys.push(k)   // any extras
-  const localR = (n: number) => 0.9 * Math.sqrt(Math.max(1, n))
+  const localR = (n: number) => FAMILY_C * Math.sqrt(Math.max(1, n))
   const maxLocal = Math.max(1, ...keys.map(k => localR(groups.get(k)!.length)))
-  const n = keys.length
-  const ringR = n <= 1 ? 0 : Math.max(maxLocal * 1.25, (maxLocal + 2.5) / Math.sin(Math.PI / n))
+  const cell = 2 * maxLocal + 4                       // uniform cell, clusters never touch
+  const cols = Math.max(1, Math.ceil(Math.sqrt(keys.length)))
+  const rows = Math.ceil(keys.length / cols)
   const out = new Map<string, Vec3>()
   keys.forEach((k, gi) => {
-    const ang = n <= 1 ? 0 : (gi / n) * Math.PI * 2
-    const gx = ringR * Math.cos(ang), gy = ringR * Math.sin(ang)
+    const ci = gi % cols, ri = Math.floor(gi / cols)
+    const gx = (ci - (cols - 1) / 2) * cell
+    const gy = ((rows - 1) / 2 - ri) * cell
     groups.get(k)!.forEach((t, i) => {
-      const r = 0.9 * Math.sqrt(i + 0.5)
+      const r = FAMILY_C * Math.sqrt(i + 0.5)
       const th = i * GOLDEN
       out.set(t.child, [gx + r * Math.cos(th), gy + r * Math.sin(th), Math.sin(i * 0.7) * 0.8])
     })
@@ -326,12 +332,12 @@ export function FamilyConstellation({ onPickSample }: Props) {
         </div>
       )}
 
-      <Canvas camera={{ position: [0, 0, 48], fov: 55 }} style={{ background: '#030608' }}>
+      <Canvas camera={{ position: [0, 0, 82], fov: 55 }} style={{ background: '#030608' }}>
         <ambientLight intensity={0.4} />
         <pointLight position={[20, 20, 20]} intensity={1.4} color={0x88bbff} />
         <pointLight position={[-20, -20, 10]} intensity={0.8} color={0xaa66ff} />
-        <Stars radius={140} depth={70} count={3500} factor={5} saturation={0.4} fade speed={0.3} />
-        <fog attach="fog" args={[0x020408, 60, 130]} />
+        <Stars radius={200} depth={90} count={3500} factor={6} saturation={0.4} fade speed={0.3} />
+        <fog attach="fog" args={[0x020408, 95, 200]} />
         <Suspense fallback={null}>
           <ConstellationGroup trios={visible} targets={targets} spin={spin} onHover={setHover} onPick={onPickSample} />
         </Suspense>
