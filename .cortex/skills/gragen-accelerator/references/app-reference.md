@@ -2,9 +2,12 @@
 
 ## Live App
 
-**URL:** `https://j4a42cpb-sfsehol-internal-marketplace.snowflakecomputing.app`  
+**FSI Builders Workshop URL:** `https://ertf2ob-sfsehol-fsi-builders-workshop-london-ifajaj.snowflakecomputing.app`  
 **Auth:** Snowflake OAuth login (Snowsight credentials)  
-**Account:** `SFSEHOL-INTERNAL_MARKETPLACE` · Role: `GRAGEN_DB_ROLE`
+**Account:** `SFSEHOL-FSI_BUILDERS_WORKSHOP_LONDON_IFAJAJ` · Connection: `fsi-builders-london` · Role: `GRAGEN_DB_ROLE`
+
+**Internal Marketplace URL (reference deploy):** `https://j4a42cpb-sfsehol-internal-marketplace.snowflakecomputing.app`  
+**Account:** `SFSEHOL-INTERNAL_MARKETPLACE` · Connection: `internal-marketplace`
 
 > **Fresh deploy URL:** The SPCS ingress URL changes after every `ALTER SERVICE FROM SPECIFICATION`.
 > Get the current URL with:
