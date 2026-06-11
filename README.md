@@ -1,12 +1,10 @@
 # GRAGEN Genomics Accelerator
 
-A genomics data application on **Snowflake Container Services (SPCS)** that ingests
-**1000 Genomes DRAGEN** variant data into an **IceChunk Zarr** store on S3 and visualises
-it through an interactive **3D DNA helix**, cohort QC dashboards, and a genome browser —
-with a **Cortex Agent** chat assistant and genome-wide clinical/research annotations.
-
-Built on the same IceChunk pattern as the weather/NetCDF accelerator: genomic position
-replaces lat/lon, allele frequency replaces weather variables.
+A genomics data visualisation and analysis application on **Snowflake Container Services (SPCS)**.
+Ingests **1000 Genomes DRAGEN** variant data into an **IceChunk Zarr** store on S3 and visualises
+it through an interactive **3D DNA helix**, cohort QC dashboards, a geographic origins globe,
+family trio constellation, and a genome browser — with a **Cortex Agent** chat assistant and
+genome-wide clinical/research annotations (ClinVar, GWAS Catalog, SFARI).
 
 ---
 
@@ -293,9 +291,10 @@ can reproduce the entire accelerator end-to-end.
 
 - **`.cortex/skills/gragen-accelerator/SKILL.md`** — the authoritative, step-by-step
   deployment + rebuild playbook (IceChunk schema, EAIs, seeding, annotation + pedigree
-  tables, agent tools, critical rules, troubleshooting, version history).
+  tables, agent tools, critical rules, troubleshooting, success criteria).
 - **`AGENT.md`** — how to operate/reproduce this project with Cortex Code, including
   connection details and the known gotchas.
+- **Version history** — see below.
 
 ---
 
@@ -306,3 +305,35 @@ can reproduce the entire accelerator end-to-end.
 - **GWAS Catalog** — EBI REST API (trait associations)
 - **SFARI Gene** — curated autism gene list (hg38 coordinates)
 - **1000G trio pedigree** — EBI `1kGP.3202_samples.pedigree_info.txt` (father/mother links)
+
+---
+
+## Version History
+
+| Version | Date | Notes |
+|---------|------|-------|
+| v1.0.45 | 2026-06-09 | **Family Constellation "🌐 Globe" mode.** Places each family at its 1000G population's real geographic origin on a Blue-Marble Earth sphere. Families spread on the local tangent plane; unknown-population families ring the south pole. Earth spins with the glyphs; smooth lerp transition from flat grids. |
+| v1.0.44 | 2026-06-09 | **Family Constellation spacing.** Switched cluster centres to a centered grid (`cols=ceil(√groups)`, uniform `cell = 2·maxLocalR + 4`), tightened spiral, pulled camera back so all four layout modes frame consistently. |
+| v1.0.43 | 2026-06-09 | **Fixed Family Constellation grouping.** Trio children are excluded from the 2,504-sample unrelated `SAMPLE_METRICS` panel → `COALESCE` superpopulation/population across child → father → mother resolves ancestry for 593/602 trios. |
+| v1.0.42 | 2026-06-09 | **Family Constellation: meaningful clustering + filter.** Layout-mode buttons (Spiral / By ancestry / By population) with lerp transitions. Superpopulation legend = filter. Prominent pause toggle + auto-pause on hover. |
+| v1.0.41 | 2026-06-09 | **New "Family Constellation" view + classic pedigree.** Phyllotaxis galaxy of 602 trios (r3f). Classic SVG pedigree in the sample panel. |
+| v1.0.40 | 2026-06-09 | **Fixed: clicking a 3D-helix annotation blanked the helix.** Auto-injected context messages now pass `skipIntent=true`. |
+| v1.0.39 | 2026-06-09 | **Agent gains cohort allele frequency + annotation joins.** New `tool_cohort_variants` reads `allele_freq` from Zarr via `GRAGEN_SLICE` and merges with ClinVar/GWAS on `(CHROM, POSITION)`. Region capped 2 Mb. |
+| v1.0.38 | 2026-06-09 | **In-UI chromosome loader works end-to-end.** New `SEED_CHROMOSOME(CHROM)` proc launches async `EXECUTE JOB SERVICE` on `GRAGEN_INGEST_POOL`; `seed_job.py` auto-restarts backend on completion. |
+| v1.0.37 | 2026-06-09 | **Committed `preflight.sh`.** Verifies CLIs, connection + ACCOUNTADMIN, AWS auth, region colocation. Auto-invoked by `setup.sh` / `provision_aws.sh` / `deploy.sh`. |
+| v1.0.36 | 2026-06-09 | Fixed backend `direct_metrics` (Cohort QC + Origins) — coverage-key + section-filter fix. |
+| v1.0.33 | 2026-06-09 | **Committed `app/build_sample_metrics.py`.** Reproducible loader for `SAMPLE_METRICS` (populates Cohort QC + Origins). Fixed coverage key + section parsing. |
+| v1.0.32 | 2026-06-09 | **Multi-SE shared-AWS provisioning.** `provision_aws.sh`: shared S3 bucket + per-prefix IAM user/role; auto-fills creds into `config.env`; `--trust` closes the external-volume IAM loop. |
+| v1.0.31 | 2026-06-09 | **Self-contained / bring-your-own-bucket.** `config.env` + `setup.sh` with SQL templates; `GENOMICS_ICEBERG_VOLUME` created; `sql/04_annotation_tables.sql` added. |
+| v1.0.30 | 2026-06-09 | Trio family links (father/mother buttons) from `SAMPLE_PEDIGREE` Iceberg table. Gosling tracks fill viewport. Agent gains `tool_pedigree`. |
+| v1.0.29 | 2026-06-09 | Dark Snowflake restyle: `#0D1117/#161B22/#2D3F53`, accent `#29B5E8`, branded sidebar + panels. |
+| v1.0.28 | 2026-06-09 | Origins globe rebuilt with react-three-fiber + bundled Earth texture. Annotation auto-navigation for sparse GWAS/SFARI. Fixed "annotations always 0" (GRANT SELECT on Iceberg tables to PUBLIC). `tool_query_annotations` added to agent. |
+| v1.0.26 | 2026-06-08 | Genome-wide annotation layer in Iceberg: `CHR22_CLINVAR` (4.43M rows, +DISEASE/GENE), `CHR22_GWAS`, `AUTISM_GENES`. Multi-source 3D helix markers with source dropdown + chat control. |
+| v1.0.25 | 2026-06-08 | ClinVar annotations on the 3D helix (hover marker → zoom + disease card). |
+| v1.0.24 | 2026-06-08 | Click a helix variant → agent explains; chat panel zooms the helix to the region. |
+| v1.0.23 | 2026-06-08 | DNA-accurate double helix (base-pair rungs, zoom); fixed gosling `rgb2hex` (pixi.js pinned ~6.5.10). |
+| v1.0.22 | 2026-06-08 | Fixed blank screen — rebuilt with React 18 deps (was React 19/drei 10). |
+| v1.0.17 | 2026-06-08 | Production release: chr22 genomics (1.93M variants, 3201 samples) + ClinVar. Replaced pysam HTTP with boto3/urllib TBI range requests (SPCS EAI proxy fix). |
+| v1.0.3 | 2026-06-07 | ClinVar overlay: `clinvar_repo/`, `/seed_clinvar`, `/direct/clinvar`, `CLINVAR_SLICE`, `NCBI_FTP_EAI`. |
+| v1.0.2 | 2026-06-07 | CSP fix, `GENOMICS_1000G_EAI`, `GRAGEN_DB` role + endpoint grants. |
+| v1.0.1 | 2026-06-07 | Initial build: chr22 IceChunk store, cohort QC scatter, genome browser, `GENOMICS_AGENT`. |
