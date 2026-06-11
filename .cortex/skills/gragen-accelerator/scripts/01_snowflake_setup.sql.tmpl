@@ -1,0 +1,187 @@
+-- =============================================================================
+-- GRAGEN Genomics Accelerator — Snowflake Setup  (TEMPLATE)
+-- =============================================================================
+-- DO NOT run this .tmpl directly. It is rendered by setup.sh (envsubst) into
+-- sql/_rendered/01_setup.sql with your config.env values, then executed.
+--
+-- Bring-your-own-bucket: all storage is namespaced under a unique prefix:
+--   s3://${S3_BUCKET}/${DEPLOY_PREFIX}/genomics_repo/   IceChunk Zarr (variants)
+--   s3://${S3_BUCKET}/${DEPLOY_PREFIX}/clinvar_repo/    IceChunk Zarr (ClinVar)
+--   s3://${S3_BUCKET}/${DEPLOY_PREFIX}/iceberg/         Iceberg external volume
+--
+-- Run with a connection whose role is ACCOUNTADMIN (needed for EAIs + external
+-- volume). No USE ROLE here so this also works in PAT-restricted sessions
+-- (workshop accounts) where USE ROLE is blocked. Secrets created by setup.sh.
+-- =============================================================================
+
+-- ── Database + schema ─────────────────────────────────────────────────────────
+CREATE DATABASE IF NOT EXISTS GRAGEN_DB;
+CREATE SCHEMA  IF NOT EXISTS GRAGEN_DB.GRAGEN;
+USE SCHEMA GRAGEN_DB.GRAGEN;
+
+-- ── Warehouse ─────────────────────────────────────────────────────────────────
+CREATE WAREHOUSE IF NOT EXISTS GRAGEN_WH
+  WAREHOUSE_SIZE = 'XSMALL'
+  AUTO_SUSPEND = 60
+  AUTO_RESUME = TRUE
+  INITIALLY_SUSPENDED = TRUE;
+
+-- ── Image repository ──────────────────────────────────────────────────────────
+CREATE IMAGE REPOSITORY IF NOT EXISTS GRAGEN_DB.GRAGEN.GRAGEN_REPO;
+
+-- ── Compute pool ──────────────────────────────────────────────────────────────
+CREATE COMPUTE POOL IF NOT EXISTS GRAGEN_COMPUTE_POOL
+  MIN_NODES = 1
+  MAX_NODES = 2
+  INSTANCE_FAMILY = CPU_X64_S
+  AUTO_RESUME = TRUE
+  AUTO_SUSPEND_SECS = 300
+  COMMENT = 'GRAGEN Genomics Accelerator compute pool';
+
+-- Larger pool for the genome-wide variant ingest job (EXECUTE JOB SERVICE).
+-- Single big node; auto-suspends quickly when the job finishes.
+CREATE COMPUTE POOL IF NOT EXISTS GRAGEN_INGEST_POOL
+  MIN_NODES = 1
+  MAX_NODES = 1
+  INSTANCE_FAMILY = CPU_X64_L
+  AUTO_RESUME = TRUE
+  AUTO_SUSPEND_SECS = 60
+  COMMENT = 'GRAGEN variant ingest pool (VCF -> IceChunk Zarr)';
+
+-- ── External Access Integrations ──────────────────────────────────────────────
+-- (EAIs require the connection role to be ACCOUNTADMIN)
+
+-- EAI 1: Your private S3 bucket — for reading/writing the IceChunk Zarr stores.
+CREATE OR REPLACE NETWORK RULE ICECHUNK_S3_NETWORK_RULE
+  TYPE = HOST_PORT
+  MODE = EGRESS
+  VALUE_LIST = (
+    's3.amazonaws.com',
+    's3.${AWS_REGION}.amazonaws.com',
+    '${S3_BUCKET}.s3.amazonaws.com',
+    '${S3_BUCKET}.s3.${AWS_REGION}.amazonaws.com'
+  );
+
+CREATE OR REPLACE EXTERNAL ACCESS INTEGRATION ICECHUNK_S3_EAI
+  ALLOWED_NETWORK_RULES = (ICECHUNK_S3_NETWORK_RULE)
+  ALLOWED_AUTHENTICATION_SECRETS = (GRAGEN_DB.GRAGEN.AWS_ACCESS_KEY_ID,
+                                    GRAGEN_DB.GRAGEN.AWS_SECRET_ACCESS_KEY)
+  ENABLED = TRUE
+  COMMENT = 'Private S3 access for the IceChunk Zarr stores';
+
+-- EAI 2: Public 1000 Genomes S3 bucket — for ingesting VCF files and reading
+--         sample metadata. Public bucket: no credentials needed, but SPCS still
+--         requires an EAI for any outbound HTTPS call.
+CREATE OR REPLACE NETWORK RULE GENOMICS_1000G_NETWORK_RULE
+  TYPE = HOST_PORT
+  MODE = EGRESS
+  VALUE_LIST = (
+    '1000genomes-dragen.s3.amazonaws.com',
+    '1000genomes-dragen.s3.us-east-1.amazonaws.com',
+    's3.us-east-1.amazonaws.com'
+  );
+
+CREATE OR REPLACE EXTERNAL ACCESS INTEGRATION GENOMICS_1000G_EAI
+  ALLOWED_NETWORK_RULES = (GENOMICS_1000G_NETWORK_RULE)
+  ENABLED = TRUE
+  COMMENT = 'Public 1000 Genomes DRAGEN S3 bucket (no auth required)';
+
+-- EAI 3: CARTO map tiles (for the genome browser base map)
+CREATE OR REPLACE NETWORK RULE CARTO_TILES_NETWORK_RULE
+  TYPE = HOST_PORT
+  MODE = EGRESS
+  VALUE_LIST = ('a.basemaps.cartocdn.com', 'b.basemaps.cartocdn.com',
+                'c.basemaps.cartocdn.com', 'd.basemaps.cartocdn.com');
+
+CREATE OR REPLACE EXTERNAL ACCESS INTEGRATION GRAGEN_MAP_TILES_EAI
+  ALLOWED_NETWORK_RULES = (CARTO_TILES_NETWORK_RULE)
+  ENABLED = TRUE;
+
+-- ── Iceberg external volume (annotations) ──────────────────────────────────────
+-- Snowflake-managed Iceberg tables (ClinVar / GWAS / SFARI / pedigree) live here.
+-- External volumes authenticate via an IAM role (NOT access keys). After this
+-- runs, setup.sh prints STORAGE_AWS_IAM_USER_ARN + STORAGE_AWS_EXTERNAL_ID —
+-- add those to ${ICEBERG_ROLE_ARN}'s trust policy before loading data.
+CREATE EXTERNAL VOLUME IF NOT EXISTS GENOMICS_ICEBERG_VOLUME
+  STORAGE_LOCATIONS = (
+    (
+      NAME = 'genomics-iceberg'
+      STORAGE_PROVIDER = 'S3'
+      STORAGE_BASE_URL = 's3://${S3_BUCKET}/${DEPLOY_PREFIX}/iceberg/'
+      STORAGE_AWS_ROLE_ARN = '${ICEBERG_ROLE_ARN}'
+    )
+  )
+  ALLOW_WRITES = TRUE
+  COMMENT = 'GRAGEN annotation Iceberg tables (prefix ${DEPLOY_PREFIX})';
+
+GRANT USAGE ON EXTERNAL VOLUME GENOMICS_ICEBERG_VOLUME TO ROLE SYSADMIN;
+
+-- ── Internal stage for CSV loads (annotation tables) ──────────────────────────
+CREATE STAGE IF NOT EXISTS GRAGEN_DB.GRAGEN.GRAGEN_LOAD_STAGE
+  COMMENT = 'Staging area for annotation CSV loads (ClinVar / GWAS / SFARI / pedigree)';
+
+-- ── Sample QC metrics table ────────────────────────────────────────────────────
+-- Populated by the /seed_genomics endpoint reading CSV files from S3.
+CREATE TABLE IF NOT EXISTS GRAGEN_DB.GRAGEN.SAMPLE_METRICS (
+  sample_id         VARCHAR(20)    NOT NULL,
+  population        VARCHAR(10),
+  superpopulation   VARCHAR(5),
+  sex               VARCHAR(10),
+  mean_coverage     FLOAT,
+  pct_duplicates    FLOAT,
+  pct_mapped        FLOAT,
+  total_reads       BIGINT,
+  mapped_reads      BIGINT,
+  dup_reads         BIGINT,
+  total_variants    INTEGER,
+  snp_count         INTEGER,
+  ins_count         INTEGER,
+  del_count         INTEGER,
+  titv_ratio        FLOAT,
+  het_count         INTEGER,
+  hom_count         INTEGER,
+  het_hom_ratio     FLOAT,
+  loaded_at         TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+  PRIMARY KEY (sample_id)
+);
+
+-- ── Deployment config (read by SEED_CHROMOSOME to build the ingest job spec) ──
+-- Holds this deployment's bucket / prefix / region so the stored proc can
+-- launch EXECUTE JOB SERVICE without itself being a rendered template.
+CREATE TABLE IF NOT EXISTS GRAGEN_DB.GRAGEN.GRAGEN_CONFIG (
+  KEY    VARCHAR NOT NULL,
+  VALUE  VARCHAR,
+  PRIMARY KEY (KEY)
+);
+DELETE FROM GRAGEN_DB.GRAGEN.GRAGEN_CONFIG
+  WHERE KEY IN ('S3_BUCKET', 'DEPLOY_PREFIX', 'AWS_REGION');
+INSERT INTO GRAGEN_DB.GRAGEN.GRAGEN_CONFIG (KEY, VALUE) VALUES
+  ('S3_BUCKET',     '${S3_BUCKET}'),
+  ('DEPLOY_PREFIX', '${DEPLOY_PREFIX}'),
+  ('AWS_REGION',    '${AWS_REGION}');
+
+-- =============================================================================
+-- Role + User setup
+-- =============================================================================
+CREATE ROLE IF NOT EXISTS GRAGEN_DB;
+CREATE USER IF NOT EXISTS GRAGEN
+  DEFAULT_ROLE      = GRAGEN_DB
+  DEFAULT_WAREHOUSE = GRAGEN_WH;
+GRANT ROLE GRAGEN_DB TO USER GRAGEN;
+
+-- DB / schema access
+GRANT USAGE ON DATABASE GRAGEN_DB TO ROLE GRAGEN_DB;
+GRANT USAGE ON SCHEMA GRAGEN_DB.GRAGEN TO ROLE GRAGEN_DB;
+GRANT ALL ON FUTURE TABLES IN SCHEMA GRAGEN_DB.GRAGEN TO ROLE GRAGEN_DB;
+GRANT USAGE ON WAREHOUSE GRAGEN_WH TO ROLE GRAGEN_DB;
+GRANT DATABASE ROLE SNOWFLAKE.CORTEX_USER TO ROLE GRAGEN_DB;
+
+-- External volume usable by the app role (for creating/querying Iceberg tables)
+GRANT USAGE ON EXTERNAL VOLUME GENOMICS_ICEBERG_VOLUME TO ROLE GRAGEN_DB;
+
+SELECT 'Setup complete. See the IAM trust-policy gate printed by setup.sh, then run the loaders + deploy.sh.' AS instructions;
+
+-- Run these AFTER services are deployed:
+-- GRANT USAGE ON SERVICE GRAGEN_DB.GRAGEN.GRAGEN_SERVICE TO ROLE GRAGEN_DB;
+-- GRANT USAGE ON SERVICE GRAGEN_DB.GRAGEN.GRAGEN_ACCELERATOR_SERVICE TO ROLE GRAGEN_DB;
+-- GRANT SERVICE ROLE GRAGEN_DB.GRAGEN.GRAGEN_ACCELERATOR_SERVICE!ALL_ENDPOINTS_USAGE TO ROLE PUBLIC;

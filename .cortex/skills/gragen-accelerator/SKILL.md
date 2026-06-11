@@ -624,7 +624,65 @@ The agent uses `type: generic` tools backed by Python stored procedures (warehou
 
 ---
 
-## Version History
+## Files in This Skill
+
+```
+scripts/
+  preflight.sh                         Verify all prerequisites before any deploy step
+  00_provision_aws.sh                  S3 bucket (if missing) + per-prefix IAM user + role; writes keys into config.env
+  01_setup.sh                          Renders sql/*.tmpl → sql/_rendered/, creates DB/pool/EAIs/secrets/volume
+  01_snowflake_setup.sql.tmpl          DB, warehouse, compute pools, image repo, EAIs, secrets, external volume — infra
+  deploy.sh                            Build + push both Docker images, CREATE/ALTER both SPCS services, print app URL
+  02_external_functions.sql            GRAGEN_SLICE, CLINVAR_SLICE ext fns + all agent tool procedures + GENOMICS_AGENT
+  03_deploy_services.sql.tmpl          SPCS CREATE SERVICE specs (gragen-service + gragen-accelerator-service)
+  04_annotation_tables.sql             DDL for CHR22_CLINVAR, CHR22_GWAS, AUTISM_GENES, SAMPLE_PEDIGREE (Iceberg)
+  05_run_genome_ingest_job.sql.tmpl    EXECUTE JOB SERVICE template for whole-genome batch ingest
+  config.env.example                   Template for config.env (DEPLOY_PREFIX, S3_BUCKET, AWS_REGION, GRAGEN_CONNECTION)
+
+Project root (not in skill — present when the repo is cloned):
+  Dockerfile                           Python FastAPI backend (gragen-service)
+  VERSION                              Semver file
+  config.env                           Your filled-in config (gitignored)
+  app/
+    main.py                            All FastAPI endpoints
+    ingest_genomics.py                 1000G VCF → IceChunk Zarr ingest
+    ingest_clinvar.py                  ClinVar VCF → IceChunk Zarr ingest
+    icechunk_client.py                 IceChunk repo open/create helpers
+    seed_job.py                        EXECUTE JOB SERVICE entry point
+    build_clinvar_iceberg.py           ClinVar → CSV → CHR22_CLINVAR Iceberg
+    build_gwas_iceberg.py              EBI GWAS Catalog → CSV → CHR22_GWAS Iceberg
+    build_sfari_iceberg.sql            SFARI autism genes → AUTISM_GENES Iceberg
+    build_pedigree_iceberg.py (+.sql)  1000G pedigree → SAMPLE_PEDIGREE Iceberg
+    build_sample_metrics.py            DRAGEN QC + metadata → SAMPLE_METRICS table
+    requirements.txt                   Python deps
+  gragen-accelerator/                  React/Vite + Express frontend
+    src/
+      GenomicsViewer.tsx               Main genome browser + chat control
+      DNAHelix.tsx                     3D double-helix variant + annotation viewer
+      CohortQC.tsx                     Cohort QC scatter plot
+      CohortGlobe.tsx                  Origins globe (react-three-fiber)
+      FamilyConstellation.tsx          Trio family galaxy + pedigree
+      DataManagementPanel.tsx          Per-chromosome Zarr seed UI
+    server/index.ts                    Express proxy + Snowflake SQL + agent SSE
+```
+
+---
+
+## Success Criteria
+
+- `curl https://<URL>/api/meta` shows `chr22` in `chromosomes_in_store`
+- `curl https://<URL>/api/meta/clinvar` shows `chr22` in `chromosomes_in_store`
+- App loads: Genome Browser renders the 3D helix + cohort variants for chr22
+- Cohort QC scatter shows ~2504 samples (loads from `SAMPLE_METRICS`)
+- Origins globe shows sample points over world map
+- 3D helix annotations: ClinVar markers (red) visible at pathogenic positions
+- GWAS + SFARI gene markers visible on helix
+- Chat: "What are the pathogenic variants in SHANK3?" → agent responds with data
+- `CALL GRAGEN_DB.GRAGEN.SEED_CHROMOSOME('chr21')` launches an async ingest job
+
+---
+
+
 
 | Version | Date | Notes |
 |---------|------|-------|

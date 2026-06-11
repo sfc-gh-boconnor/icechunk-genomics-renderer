@@ -1,0 +1,715 @@
+-- =============================================================================
+-- GRAGEN Genomics Accelerator — External Functions + Cortex Agent  v1.0.1
+-- =============================================================================
+-- Run AFTER deploying SPCS services (the API integration needs the endpoint URL).
+--
+-- Usage:
+--   snow sql -f sql/02_external_functions.sql -c <CONNECTION>
+-- =============================================================================
+
+-- Runs as the connection's role (must be ACCOUNTADMIN; no USE ROLE so this works
+-- in PAT-restricted sessions too).
+USE SCHEMA GRAGEN_DB.GRAGEN;
+USE WAREHOUSE GRAGEN_WH;
+
+-- App service-identity role (grants below target it). setup.sh creates role
+-- GRAGEN_DB; GRAGEN_DB_ROLE is the legacy/app role name — ensure it exists so
+-- the grants succeed on a fresh account too.
+CREATE ROLE IF NOT EXISTS GRAGEN_DB_ROLE;
+
+-- ── SPCS service functions: GRAGEN_SLICE / GRAGEN_CLINVAR_SLICE ──────────────
+-- The genome browser fetches variants via these SQL functions (server/index.ts
+-- calls GRAGEN_SLICE(chrom,start,end) and GRAGEN_CLINVAR_SLICE(chrom,start,end)).
+-- They are SPCS *service functions* bound to GRAGEN_SERVICE's api-endpoint — NOT
+-- API-integration external functions. The backend handlers are POST /slice and
+-- POST /slice_clinvar. Run AFTER the backend service exists (deploy.sh).
+CREATE OR REPLACE FUNCTION GRAGEN_DB.GRAGEN.GRAGEN_SLICE(CHROM VARCHAR, START_POS INTEGER, END_POS INTEGER)
+  RETURNS VARIANT
+  SERVICE = GRAGEN_DB.GRAGEN.GRAGEN_SERVICE
+  ENDPOINT = 'api-endpoint'
+  AS '/slice';
+
+CREATE OR REPLACE FUNCTION GRAGEN_DB.GRAGEN.GRAGEN_CLINVAR_SLICE(CHROM VARCHAR, START_POS INTEGER, END_POS INTEGER)
+  RETURNS VARIANT
+  SERVICE = GRAGEN_DB.GRAGEN.GRAGEN_SERVICE
+  ENDPOINT = 'api-endpoint'
+  AS '/slice_clinvar';
+
+GRANT USAGE ON FUNCTION GRAGEN_DB.GRAGEN.GRAGEN_SLICE(VARCHAR,INTEGER,INTEGER) TO ROLE PUBLIC;
+GRANT USAGE ON FUNCTION GRAGEN_DB.GRAGEN.GRAGEN_CLINVAR_SLICE(VARCHAR,INTEGER,INTEGER) TO ROLE PUBLIC;
+GRANT USAGE ON FUNCTION GRAGEN_DB.GRAGEN.GRAGEN_SLICE(VARCHAR,INTEGER,INTEGER) TO ROLE GRAGEN_DB;
+GRANT USAGE ON FUNCTION GRAGEN_DB.GRAGEN.GRAGEN_CLINVAR_SLICE(VARCHAR,INTEGER,INTEGER) TO ROLE GRAGEN_DB;
+
+-- ── SEED_CHROMOSOME: launch the out-of-container variant ingest job ──────────
+-- Called by the frontend Data Management panel (CALL SEED_CHROMOSOME('chr1')).
+-- Launches an ASYNC EXECUTE JOB SERVICE on GRAGEN_INGEST_POOL (16 workers, fast)
+-- that ingests one chromosome's 1000G VCF into the IceChunk Zarr store. Reads
+-- the deployment's bucket/prefix/region from GRAGEN_CONFIG (populated by setup.sh)
+-- so it works on any deployment. The job image is gragen-service:latest (pushed
+-- by deploy.sh). seed_job.py restarts GRAGEN_SERVICE on success (RESTART_SERVICE)
+-- so the backend re-opens the store and serves the new chromosome.
+-- Owner's-rights proc: the owner role needs CREATE SERVICE on the schema + USAGE
+-- on GRAGEN_INGEST_POOL + READ on the image repo/EAIs (ACCOUNTADMIN has these).
+CREATE OR REPLACE PROCEDURE GRAGEN_DB.GRAGEN.SEED_CHROMOSOME(CHROM VARCHAR)
+  RETURNS VARIANT
+  LANGUAGE SQL
+  EXECUTE AS OWNER
+AS
+$$
+DECLARE
+  v_chrom    VARCHAR;
+  v_bucket   VARCHAR;
+  v_prefix   VARCHAR;
+  v_region   VARCHAR;
+  v_job      VARCHAR;
+  v_stmt     VARCHAR;
+BEGIN
+  -- Normalize + validate the chromosome (chr1..chr22, chrX, chrY).
+  v_chrom := LOWER(CHROM);
+  IF (NOT v_chrom RLIKE '^chr([1-9]|1[0-9]|2[0-2]|x|y)$') THEN
+    RETURN OBJECT_CONSTRUCT('status', 'error',
+                            'message', 'Invalid chromosome: ' || CHROM);
+  END IF;
+
+  SELECT VALUE INTO v_bucket FROM GRAGEN_DB.GRAGEN.GRAGEN_CONFIG WHERE KEY = 'S3_BUCKET';
+  SELECT VALUE INTO v_prefix FROM GRAGEN_DB.GRAGEN.GRAGEN_CONFIG WHERE KEY = 'DEPLOY_PREFIX';
+  SELECT VALUE INTO v_region FROM GRAGEN_DB.GRAGEN.GRAGEN_CONFIG WHERE KEY = 'AWS_REGION';
+
+  IF (v_bucket IS NULL) THEN
+    RETURN OBJECT_CONSTRUCT('status', 'error',
+                            'message', 'GRAGEN_CONFIG not populated — re-run setup.sh');
+  END IF;
+
+  -- Unique job name per (chrom, second) so re-seeds don't collide with retained metadata.
+  v_job := 'GRAGEN_SEED_' || UPPER(REPLACE(v_chrom, 'chr', '')) || '_'
+           || TO_VARCHAR(DATE_PART('epoch_second', CURRENT_TIMESTAMP()));
+
+  v_stmt :=
+    'EXECUTE JOB SERVICE IN COMPUTE POOL GRAGEN_INGEST_POOL ' ||
+    'NAME = GRAGEN_DB.GRAGEN.' || v_job || ' ' ||
+    'ASYNC = TRUE ' ||
+    'EXTERNAL_ACCESS_INTEGRATIONS = (ICECHUNK_S3_EAI, GENOMICS_1000G_EAI) ' ||
+    'FROM SPECIFICATION ' || CHR(36) || CHR(36) || '
+spec:
+  containers:
+  - name: seed
+    image: /gragen_db/gragen/gragen_repo/gragen-service:latest
+    command: ["python3", "/app/seed_job.py"]
+    env:
+      SEED_TYPE: genomics
+      SEED_CHROMS: "' || v_chrom || '"
+      ICECHUNK_BUCKET: "' || v_bucket || '"
+      ICECHUNK_GENOMICS_PREFIX: "' || v_prefix || '/genomics_repo"
+      AWS_DEFAULT_REGION: "' || v_region || '"
+      INGEST_WORKERS: "16"
+      RESTART_SERVICE: "GRAGEN_DB.GRAGEN.GRAGEN_SERVICE"
+    secrets:
+    - snowflakeSecret:
+        objectName: GRAGEN_DB.GRAGEN.AWS_ACCESS_KEY_ID
+      envVarName: AWS_ACCESS_KEY_ID
+    - snowflakeSecret:
+        objectName: GRAGEN_DB.GRAGEN.AWS_SECRET_ACCESS_KEY
+      envVarName: AWS_SECRET_ACCESS_KEY
+' || CHR(36) || CHR(36);
+
+  EXECUTE IMMEDIATE :v_stmt;
+
+  RETURN OBJECT_CONSTRUCT(
+    'status',  'seeding',
+    'chrom',   v_chrom,
+    'job',     v_job,
+    'message', 'Ingest launched on GRAGEN_INGEST_POOL (~minutes). The backend '
+               || 'auto-restarts on completion; refresh status when done.');
+END;
+$$;
+
+GRANT USAGE ON PROCEDURE GRAGEN_DB.GRAGEN.SEED_CHROMOSOME(VARCHAR) TO ROLE PUBLIC;
+GRANT USAGE ON PROCEDURE GRAGEN_DB.GRAGEN.SEED_CHROMOSOME(VARCHAR) TO ROLE GRAGEN_DB;
+
+
+-- ── Cortex Agent ─────────────────────────────────────────────────────────────
+-- Tool stored procedures called by the GENOMICS_AGENT
+
+-- Tool 1: Cohort summary query
+CREATE OR REPLACE PROCEDURE GRAGEN_DB.GRAGEN.TOOL_COHORT_QUERY(
+  QUESTION VARCHAR
+)
+RETURNS VARIANT
+LANGUAGE PYTHON
+RUNTIME_VERSION = '3.11'
+PACKAGES = ('snowflake-snowpark-python')
+HANDLER = 'run'
+AS
+$$
+def run(session, question: str) -> dict:
+    try:
+        # Get top-level cohort stats
+        summary = session.sql("""
+            SELECT
+                superpopulation,
+                COUNT(*)                           AS sample_count,
+                ROUND(AVG(mean_coverage), 1)       AS avg_coverage,
+                ROUND(AVG(pct_duplicates), 2)      AS avg_dup_pct,
+                ROUND(AVG(titv_ratio), 3)          AS avg_titv,
+                ROUND(AVG(total_variants), 0)      AS avg_variants,
+                ROUND(AVG(het_hom_ratio), 3)       AS avg_het_hom
+            FROM GRAGEN_DB.GRAGEN.SAMPLE_METRICS
+            WHERE mean_coverage IS NOT NULL
+            GROUP BY superpopulation
+            ORDER BY superpopulation
+        """).collect()
+        return {
+            'cohort_stats': [row.as_dict() for row in summary],
+            'status': 'SUCCESS'
+        }
+    except Exception as e:
+        return {'error': str(e), 'status': 'FAILED'}
+$$;
+
+-- Tool 2: Sample metadata lookup
+CREATE OR REPLACE PROCEDURE GRAGEN_DB.GRAGEN.TOOL_SAMPLE_META(
+  SAMPLE_ID VARCHAR
+)
+RETURNS VARIANT
+LANGUAGE PYTHON
+RUNTIME_VERSION = '3.11'
+PACKAGES = ('snowflake-snowpark-python')
+HANDLER = 'run'
+AS
+$$
+def run(session, sample_id: str) -> dict:
+    try:
+        rows = session.sql(f"""
+            SELECT * FROM GRAGEN_DB.GRAGEN.SAMPLE_METRICS
+            WHERE sample_id = '{sample_id.replace("'","''")}' LIMIT 1
+        """).collect()
+        if not rows:
+            return {'error': f'Sample {sample_id} not found', 'status': 'FAILED'}
+        return {'sample': rows[0].as_dict(), 'status': 'SUCCESS'}
+    except Exception as e:
+        return {'error': str(e), 'status': 'FAILED'}
+$$;
+
+-- Tool 3: Outlier detection
+CREATE OR REPLACE PROCEDURE GRAGEN_DB.GRAGEN.TOOL_FIND_OUTLIERS(
+  METRIC  VARCHAR,
+  N_TOP   INTEGER
+)
+RETURNS VARIANT
+LANGUAGE PYTHON
+RUNTIME_VERSION = '3.11'
+PACKAGES = ('snowflake-snowpark-python')
+HANDLER = 'run'
+AS
+$$
+def run(session, metric: str, n_top: int = 10) -> dict:
+    allowed = {'mean_coverage','pct_duplicates','titv_ratio','total_variants','het_hom_ratio'}
+    if metric not in allowed:
+        return {'error': f'Metric must be one of {sorted(allowed)}', 'status': 'FAILED'}
+    try:
+        rows = session.sql(f"""
+            SELECT sample_id, population, superpopulation, {metric}
+            FROM GRAGEN_DB.GRAGEN.SAMPLE_METRICS
+            WHERE {metric} IS NOT NULL
+            ORDER BY {metric} DESC
+            LIMIT {int(n_top)}
+        """).collect()
+        return {'outliers': [r.as_dict() for r in rows], 'metric': metric, 'status': 'SUCCESS'}
+    except Exception as e:
+        return {'error': str(e), 'status': 'FAILED'}
+$$;
+
+-- Tool 4: Genome annotation query (ClinVar / GWAS / SFARI Iceberg tables)
+-- Supports three modes: by region, by gene, and summary counts.
+CREATE OR REPLACE PROCEDURE GRAGEN_DB.GRAGEN.TOOL_QUERY_ANNOTATIONS(
+  SOURCE     VARCHAR DEFAULT 'clinvar',
+  CHROM      VARCHAR DEFAULT NULL,
+  START_POS  INTEGER DEFAULT NULL,
+  END_POS    INTEGER DEFAULT NULL,
+  GENE       VARCHAR DEFAULT NULL,
+  SUMMARY    BOOLEAN DEFAULT FALSE
+)
+RETURNS VARIANT
+LANGUAGE PYTHON
+RUNTIME_VERSION = '3.11'
+PACKAGES = ('snowflake-snowpark-python')
+HANDLER = 'run'
+AS
+$$
+CLINSIG = {0:'Benign',1:'Likely benign',2:'VUS',3:'Likely pathogenic',4:'Pathogenic',5:'Conflicting',6:'Other'}
+
+def _q(session, sql):
+    return [r.as_dict() for r in session.sql(sql).collect()]
+
+def run(session, source='clinvar', chrom=None, start_pos=None, end_pos=None, gene=None, summary=False):
+    try:
+        source = (source or 'clinvar').lower().strip()
+        if source not in ('clinvar','gwas','sfari','all'):
+            return {'error': "source must be clinvar, gwas, sfari, or all", 'status':'FAILED'}
+
+        def esc(s): return str(s).replace("'", "''")
+
+        # ── Gene mode: resolve the gene to a region, then query that region ──
+        if gene:
+            g = esc(gene.upper())
+            row = _q(session, f"""SELECT CHROM, START_POS, END_POS
+                                    FROM GRAGEN_DB.GRAGEN.AUTISM_GENES
+                                   WHERE UPPER(GENE)='{g}' LIMIT 1""")
+            if not row:
+                row = _q(session, f"""SELECT CHROM, MIN(POSITION) AS START_POS, MAX(POSITION) AS END_POS
+                                        FROM GRAGEN_DB.GRAGEN.CHR22_CLINVAR
+                                       WHERE UPPER(GENE)='{g}' GROUP BY CHROM
+                                       ORDER BY COUNT(*) DESC LIMIT 1""")
+            if not row:
+                return {'error': f'Gene {gene} not found in SFARI or ClinVar annotations', 'status':'FAILED'}
+            chrom     = row[0]['CHROM']
+            start_pos = int(row[0]['START_POS'])
+            end_pos   = int(row[0]['END_POS'])
+
+        # Build an optional region predicate
+        where = []
+        if chrom:     where.append(f"CHROM='{esc(chrom)}'")
+        if start_pos is not None and end_pos is not None:
+            where.append(f"POSITION BETWEEN {int(start_pos)} AND {int(end_pos)}")
+        wc = (" WHERE " + " AND ".join(where)) if where else ""
+
+        # ── Summary mode: counts per category ──
+        if summary:
+            res = {'mode':'summary', 'region': {'chrom':chrom,'start':start_pos,'end':end_pos}, 'status':'SUCCESS'}
+            if source in ('clinvar','all'):
+                rows = _q(session, f"SELECT CLINSIG, COUNT(*) N FROM GRAGEN_DB.GRAGEN.CHR22_CLINVAR{wc} GROUP BY CLINSIG ORDER BY CLINSIG")
+                res['clinvar'] = {CLINSIG.get(int(r['CLINSIG']), str(r['CLINSIG'])): int(r['N']) for r in rows}
+            if source in ('gwas','all'):
+                rows = _q(session, f"SELECT TRAIT, COUNT(*) N FROM GRAGEN_DB.GRAGEN.CHR22_GWAS{wc} GROUP BY TRAIT ORDER BY N DESC")
+                res['gwas'] = {r['TRAIT']: int(r['N']) for r in rows}
+            if source in ('sfari','all'):
+                gwc = wc.replace("POSITION BETWEEN", "START_POS >=").replace(" AND ", " AND END_POS <= ", 1) if (start_pos is not None) else wc
+                # simpler overlap predicate for gene regions
+                sf_where = []
+                if chrom: sf_where.append(f"CHROM='{esc(chrom)}'")
+                if start_pos is not None and end_pos is not None:
+                    sf_where.append(f"END_POS>={int(start_pos)} AND START_POS<={int(end_pos)}")
+                sfwc = (" WHERE " + " AND ".join(sf_where)) if sf_where else ""
+                rows = _q(session, f"SELECT COUNT(*) N FROM GRAGEN_DB.GRAGEN.AUTISM_GENES{sfwc}")
+                res['sfari_gene_count'] = int(rows[0]['N']) if rows else 0
+            return res
+
+        # ── Region/row mode: return matching annotation rows (capped) ──
+        if source == 'clinvar':
+            rows = _q(session, f"""SELECT POSITION, CLINSIG, DISEASE, GENE, ALLELE_ID
+                                     FROM GRAGEN_DB.GRAGEN.CHR22_CLINVAR{wc}
+                                    ORDER BY CLINSIG DESC, POSITION LIMIT 100""")
+            for r in rows: r['SIGNIFICANCE'] = CLINSIG.get(int(r['CLINSIG']), str(r['CLINSIG']))
+            return {'mode':'region','source':'clinvar','count':len(rows),'annotations':rows,'status':'SUCCESS'}
+        if source == 'gwas':
+            rows = _q(session, f"""SELECT POSITION, TRAIT, MAPPED_GENE, RSID, RISK_ALLELE, P_VALUE
+                                     FROM GRAGEN_DB.GRAGEN.CHR22_GWAS{wc}
+                                    ORDER BY POSITION LIMIT 100""")
+            return {'mode':'region','source':'gwas','count':len(rows),'annotations':rows,'status':'SUCCESS'}
+        # sfari
+        sf_where = []
+        if chrom: sf_where.append(f"CHROM='{esc(chrom)}'")
+        if start_pos is not None and end_pos is not None:
+            sf_where.append(f"END_POS>={int(start_pos)} AND START_POS<={int(end_pos)}")
+        sfwc = (" WHERE " + " AND ".join(sf_where)) if sf_where else ""
+        rows = _q(session, f"""SELECT GENE, CHROM, START_POS, END_POS, SFARI_SCORE, NOTE
+                                 FROM GRAGEN_DB.GRAGEN.AUTISM_GENES{sfwc}
+                                ORDER BY START_POS LIMIT 100""")
+        return {'mode':'region','source':'sfari','count':len(rows),'annotations':rows,'status':'SUCCESS'}
+    except Exception as e:
+        return {'error': str(e), 'status':'FAILED'}
+$$;
+
+-- Tool 5: Trio pedigree (1000G mother/father/children) over SAMPLE_PEDIGREE
+CREATE OR REPLACE PROCEDURE GRAGEN_DB.GRAGEN.TOOL_PEDIGREE(
+  SAMPLE_ID VARCHAR
+)
+RETURNS VARIANT
+LANGUAGE PYTHON
+RUNTIME_VERSION = '3.11'
+PACKAGES = ('snowflake-snowpark-python')
+HANDLER = 'run'
+AS
+$$
+def run(session, sample_id: str) -> dict:
+    try:
+        sid = (sample_id or '').strip().replace("'", "''")
+        if not sid:
+            return {'error': 'sample_id required', 'status': 'FAILED'}
+        rows = session.sql(f"""
+            SELECT SAMPLE_ID, FATHER_ID, MOTHER_ID, SEX, RELATIONSHIP
+              FROM GRAGEN_DB.GRAGEN.SAMPLE_PEDIGREE WHERE SAMPLE_ID = '{sid}' LIMIT 1
+        """).collect()
+        if not rows:
+            return {'error': f'Sample {sample_id} not in pedigree', 'status': 'FAILED'}
+        r = rows[0].as_dict()
+        # Children where this sample is a parent
+        kids = session.sql(f"""
+            SELECT SAMPLE_ID FROM GRAGEN_DB.GRAGEN.SAMPLE_PEDIGREE
+             WHERE FATHER_ID = '{sid}' OR MOTHER_ID = '{sid}'
+             ORDER BY SAMPLE_ID
+        """).collect()
+        return {
+            'sample':       r.get('SAMPLE_ID'),
+            'sex':          r.get('SEX'),
+            'father':       r.get('FATHER_ID'),
+            'mother':       r.get('MOTHER_ID'),
+            'relationship': r.get('RELATIONSHIP'),
+            'is_trio_child': bool(r.get('FATHER_ID') or r.get('MOTHER_ID')),
+            'children':     [k.as_dict().get('SAMPLE_ID') for k in kids],
+            'status': 'SUCCESS',
+        }
+    except Exception as e:
+        return {'error': str(e), 'status': 'FAILED'}
+$$;
+
+-- Tool 6: Cohort allele frequency joined to annotations (Zarr ⋈ Iceberg by position)
+-- Reads per-position cohort allele frequency from the IceChunk Zarr store via the
+-- GRAGEN_SLICE service function (no materialization — the genomes stay in Zarr) and
+-- merges it with ClinVar / GWAS annotation rows on (CHROM, POSITION). Answers
+-- "what is the cohort allele frequency at pathogenic ClinVar sites in <gene/region>".
+CREATE OR REPLACE PROCEDURE GRAGEN_DB.GRAGEN.TOOL_COHORT_VARIANTS(
+  SOURCE         VARCHAR DEFAULT 'clinvar',
+  CHROM          VARCHAR DEFAULT NULL,
+  START_POS      INTEGER DEFAULT NULL,
+  END_POS        INTEGER DEFAULT NULL,
+  GENE           VARCHAR DEFAULT NULL,
+  ANNOTATED_ONLY BOOLEAN DEFAULT TRUE
+)
+RETURNS VARIANT
+LANGUAGE PYTHON
+RUNTIME_VERSION = '3.11'
+PACKAGES = ('snowflake-snowpark-python')
+HANDLER = 'run'
+AS
+$$
+CLINSIG = {0:'Benign',1:'Likely benign',2:'VUS',3:'Likely pathogenic',4:'Pathogenic',5:'Conflicting',6:'Other'}
+MAX_REGION = 2_000_000   # cap region width (bp) to bound latency
+COMMON_AF  = 0.05        # threshold for "common" cohort variant
+
+def _q(session, sql):
+    return [r.as_dict() for r in session.sql(sql).collect()]
+
+def run(session, source='clinvar', chrom=None, start_pos=None, end_pos=None, gene=None, annotated_only=True):
+    try:
+        source = (source or 'clinvar').lower().strip()
+        if source not in ('clinvar', 'gwas'):
+            return {'error': "source must be clinvar or gwas", 'status': 'FAILED'}
+
+        def esc(s): return str(s).replace("'", "''")
+
+        # ── Gene mode: resolve to a region (SFARI first, then ClinVar) ──
+        if gene:
+            g = esc(gene.upper())
+            row = _q(session, f"""SELECT CHROM, START_POS, END_POS
+                                    FROM GRAGEN_DB.GRAGEN.AUTISM_GENES
+                                   WHERE UPPER(GENE)='{g}' LIMIT 1""")
+            if not row:
+                row = _q(session, f"""SELECT CHROM, MIN(POSITION) AS START_POS, MAX(POSITION) AS END_POS
+                                        FROM GRAGEN_DB.GRAGEN.CHR22_CLINVAR
+                                       WHERE UPPER(GENE)='{g}' GROUP BY CHROM
+                                       ORDER BY COUNT(*) DESC LIMIT 1""")
+            if not row:
+                return {'error': f'Gene {gene} not found in SFARI or ClinVar annotations', 'status': 'FAILED'}
+            chrom     = row[0]['CHROM']
+            start_pos = int(row[0]['START_POS'])
+            end_pos   = int(row[0]['END_POS'])
+
+        if not chrom or start_pos is None or end_pos is None:
+            return {'error': 'Provide either gene, or chrom + start_pos + end_pos', 'status': 'FAILED'}
+        start_pos, end_pos = int(start_pos), int(end_pos)
+        if end_pos < start_pos:
+            start_pos, end_pos = end_pos, start_pos
+        if end_pos - start_pos > MAX_REGION:
+            return {'error': f'Region too wide ({end_pos-start_pos:,} bp). Max {MAX_REGION:,} bp — narrow the region or use a gene.', 'status': 'FAILED'}
+
+        # ── Cohort allele frequency from the Zarr store (GRAGEN_SLICE service fn) ──
+        slice_rows = _q(session, f"""SELECT GRAGEN_DB.GRAGEN.GRAGEN_SLICE('{esc(chrom)}', {start_pos}, {end_pos}) AS R""")
+        sl = slice_rows[0]['R'] if slice_rows else None
+        if isinstance(sl, str):
+            import json
+            sl = json.loads(sl)
+        if not sl or sl.get('error'):
+            return {'error': f"Cohort store unavailable: {sl.get('error') if sl else 'no data'}", 'status': 'FAILED'}
+        af_by_pos = {int(d['pos']): round(float(d['value']), 6) for d in (sl.get('data') or [])}
+
+        # ── Annotation rows for the same region ──
+        wc = f" WHERE CHROM='{esc(chrom)}' AND POSITION BETWEEN {start_pos} AND {end_pos}"
+        if source == 'clinvar':
+            ann = _q(session, f"""SELECT POSITION, CLINSIG, DISEASE, GENE, ALLELE_ID
+                                    FROM GRAGEN_DB.GRAGEN.CHR22_CLINVAR{wc}
+                                   ORDER BY CLINSIG DESC, POSITION LIMIT 500""")
+            for r in ann:
+                r['SIGNIFICANCE'] = CLINSIG.get(int(r['CLINSIG']), str(r['CLINSIG']))
+        else:  # gwas
+            ann = _q(session, f"""SELECT POSITION, TRAIT, MAPPED_GENE, RSID, RISK_ALLELE, P_VALUE
+                                    FROM GRAGEN_DB.GRAGEN.CHR22_GWAS{wc}
+                                   ORDER BY POSITION LIMIT 500""")
+
+        # ── Merge by position ──
+        merged, n_with_af, af_sum = [], 0, 0.0
+        for r in ann:
+            pos = int(r['POSITION'])
+            af  = af_by_pos.get(pos)
+            r['COHORT_ALLELE_FREQ'] = af
+            if af is not None:
+                n_with_af += 1
+                af_sum    += af
+            if annotated_only and af is None:
+                continue
+            merged.append(r)
+
+        merged.sort(key=lambda x: (x.get('COHORT_ALLELE_FREQ') or -1), reverse=True)
+        return {
+            'mode': 'cohort_variants',
+            'source': source,
+            'region': {'chrom': chrom, 'start': start_pos, 'end': end_pos},
+            'cohort_positions_in_region': len(af_by_pos),
+            'annotated_sites': len(ann),
+            'annotated_sites_with_cohort_af': n_with_af,
+            'mean_cohort_af_at_annotated_sites': round(af_sum / n_with_af, 6) if n_with_af else None,
+            'common_annotated_sites_af_gt_0_05': sum(1 for v in (r.get('COHORT_ALLELE_FREQ') for r in ann) if v is not None and v > COMMON_AF),
+            'count': len(merged[:100]),
+            'variants': merged[:100],
+            'status': 'SUCCESS',
+        }
+    except Exception as e:
+        return {'error': str(e), 'status': 'FAILED'}
+$$;
+
+-- ── Create the Cortex Agent ───────────────────────────────────────────────────
+CREATE OR REPLACE AGENT GRAGEN_DB.GRAGEN.GENOMICS_AGENT
+COMMENT = 'Genomics analysis agent for the 1000 Genomes DRAGEN re-analysis dataset (3,202 samples, hg38 graph-based).'
+PROFILE = '{"display_name": "Genomics Agent", "color": "green"}'
+FROM SPECIFICATION $$
+models:
+  orchestration: auto
+orchestration:
+  budget:
+    seconds: 120
+    tokens: 32000
+instructions:
+  system: |
+    You are a genomics data analyst for the 1000 Genomes Project DRAGEN re-analysis dataset.
+    
+    Dataset: 3,202 samples re-processed with Illumina DRAGEN 3.7.6 against the hg38 graph-based reference.
+    Superpopulations: AFR (African), AMR (Admixed American), EAS (East Asian), EUR (European), SAS (South Asian).
+    
+    QC metrics available:
+    - mean_coverage: average depth of coverage (typically 25-35×)
+    - pct_duplicates: % of reads marked as duplicates (typically 5-15%)
+    - titv_ratio: transition/transversion ratio (typically 1.9-2.1 for WGS)
+    - total_variants: total called variants per sample (~4-6 million for WGS)
+    - het_hom_ratio: heterozygous/homozygous variant ratio
+    
+    CRITICAL RULES:
+    1. ALWAYS call a tool for data questions. Never invent statistics.
+    2. Use tool_cohort_query for population-level comparisons.
+    3. Use tool_sample_meta for questions about a specific sample ID.
+    4. Use tool_find_outliers for "which samples have highest/lowest X" questions.
+    5. Use tool_query_annotations for clinical/research annotation questions —
+       ClinVar (disease, clinical significance, gene), GWAS Catalog (trait
+       associations), and SFARI (autism genes). Pass a gene (e.g. SHANK3) to
+       auto-locate its region, or a chrom + start_pos/end_pos for a region. Set
+       summary=true for counts (e.g. "how many pathogenic variants on chr22").
+    6. Use tool_pedigree for family/trio questions — the father and mother sample
+       IDs of a sample, whether it is a trio child, and its children. The 1000
+       Genomes 3,202-sample set includes 602 parent-offspring trios.
+    7. Use tool_cohort_variants for COHORT ALLELE FREQUENCY questions and to relate
+       cohort frequency to annotations — it reads per-position allele frequency from
+       the cohort genome store and joins it to ClinVar/GWAS by position. Pass a gene
+       (e.g. SHANK3) or a chrom + start_pos/end_pos region. Use it for questions like
+       "what is the allele frequency of pathogenic ClinVar sites in <gene/region>" or
+       "are GWAS risk sites in <region> common in the cohort". (tool_query_annotations
+       returns annotations alone; tool_cohort_variants adds the cohort frequency.)
+    8. Report population differences objectively — differences in Ti/Tv or variant counts reflect population history and ascertainment, not quality.
+
+    Annotation sources (queryable via tool_query_annotations):
+    - clinvar: clinical significance (Benign…Pathogenic), associated disease, gene
+    - gwas:    GWAS Catalog trait associations (trait, mapped gene, risk allele, p-value)
+    - sfari:   curated autism-associated gene regions with SFARI scores
+
+  response: |
+    Be concise. Always show:
+    - Actual numbers from the data
+    - Population context (AFR/AMR/EAS/EUR/SAS)
+    - Brief biological interpretation where relevant
+    Format as a short paragraph followed by a table if comparing populations.
+
+tools:
+  - tool_spec:
+      type: generic
+      name: tool_cohort_query
+      description: "Get QC statistics grouped by superpopulation (AFR/AMR/EAS/EUR/SAS): sample counts, coverage, duplicate rate, Ti/Tv ratio, variant counts."
+      input_schema:
+        type: object
+        properties:
+          question:
+            type: string
+            description: "Natural language question about the cohort"
+        required: [question]
+  - tool_spec:
+      type: generic
+      name: tool_sample_meta
+      description: "Get QC metrics for a specific sample ID (e.g. HG00096, NA20502)."
+      input_schema:
+        type: object
+        properties:
+          sample_id:
+            type: string
+            description: "1000 Genomes sample ID (e.g. HG00096)"
+        required: [sample_id]
+  - tool_spec:
+      type: generic
+      name: tool_find_outliers
+      description: "Find samples with the highest or lowest value of a QC metric."
+      input_schema:
+        type: object
+        properties:
+          metric:
+            type: string
+            description: "Metric name: mean_coverage, pct_duplicates, titv_ratio, total_variants, het_hom_ratio"
+          n_top:
+            type: integer
+            description: "Number of top samples to return (default 10)"
+        required: [metric]
+  - tool_spec:
+      type: generic
+      name: tool_query_annotations
+      description: "Query genome annotations from ClinVar (clinical significance + disease + gene), the GWAS Catalog (trait associations), or SFARI (autism genes). Three modes: (1) by region — pass source + chrom + start_pos + end_pos; (2) by gene — pass source + gene (e.g. SHANK3) to auto-resolve its region; (3) summary — pass summary=true with a region/chrom to get counts per clinical significance / trait / gene. Use source='all' with summary for a cross-source overview."
+      input_schema:
+        type: object
+        properties:
+          source:
+            type: string
+            description: "Annotation source: clinvar, gwas, sfari, or all (all only for summary)"
+          chrom:
+            type: string
+            description: "Chromosome, e.g. chr22"
+          start_pos:
+            type: integer
+            description: "Region start (bp)"
+          end_pos:
+            type: integer
+            description: "Region end (bp)"
+          gene:
+            type: string
+            description: "Gene symbol to locate, e.g. SHANK3 — auto-resolves chrom/start/end"
+          summary:
+            type: boolean
+            description: "If true, return counts per significance/trait/gene instead of rows"
+        required: [source]
+  - tool_spec:
+      type: generic
+      name: tool_pedigree
+      description: "Look up the 1000 Genomes trio pedigree for a sample: its father and mother sample IDs, sex, whether it is a trio child, and any children it is a parent of. Use for questions about family relationships, parents, trios, mother/father of a sample."
+      input_schema:
+        type: object
+        properties:
+          sample_id:
+            type: string
+            description: "1000 Genomes sample ID (e.g. HG00405)"
+        required: [sample_id]
+
+  - tool_spec:
+      type: generic
+      name: tool_cohort_variants
+      description: "Get cohort allele frequency for variants and join it to annotations. Reads per-position allele frequency from the cohort genome store and merges it with ClinVar (clinical significance, disease, gene) or GWAS (trait, risk allele) on genomic position. Pass a gene (e.g. SHANK3) to auto-resolve its region, or chrom + start_pos + end_pos. Use for 'allele frequency of pathogenic ClinVar sites in X', 'how common are GWAS risk sites in region Y'. Set annotated_only=false to include cohort positions without an annotation. Region capped at 2 Mb."
+      input_schema:
+        type: object
+        properties:
+          source:
+            type: string
+            description: "Annotation source to join against: clinvar or gwas"
+          chrom:
+            type: string
+            description: "Chromosome, e.g. chr22"
+          start_pos:
+            type: integer
+            description: "Region start (bp)"
+          end_pos:
+            type: integer
+            description: "Region end (bp)"
+          gene:
+            type: string
+            description: "Gene symbol to locate, e.g. SHANK3 — auto-resolves chrom/start/end"
+          annotated_only:
+            type: boolean
+            description: "If true (default), return only positions that have an annotation; if false, include all cohort positions in the region"
+        required: [source]
+
+tool_resources:
+  tool_cohort_query:
+    type: procedure
+    identifier: GRAGEN_DB.GRAGEN.TOOL_COHORT_QUERY
+    execution_environment:
+      type: warehouse
+      warehouse: GRAGEN_WH
+  tool_sample_meta:
+    type: procedure
+    identifier: GRAGEN_DB.GRAGEN.TOOL_SAMPLE_META
+    execution_environment:
+      type: warehouse
+      warehouse: GRAGEN_WH
+  tool_find_outliers:
+    type: procedure
+    identifier: GRAGEN_DB.GRAGEN.TOOL_FIND_OUTLIERS
+    execution_environment:
+      type: warehouse
+      warehouse: GRAGEN_WH
+  tool_query_annotations:
+    type: procedure
+    identifier: GRAGEN_DB.GRAGEN.TOOL_QUERY_ANNOTATIONS
+    execution_environment:
+      type: warehouse
+      warehouse: GRAGEN_WH
+  tool_pedigree:
+    type: procedure
+    identifier: GRAGEN_DB.GRAGEN.TOOL_PEDIGREE
+    execution_environment:
+      type: warehouse
+      warehouse: GRAGEN_WH
+  tool_cohort_variants:
+    type: procedure
+    identifier: GRAGEN_DB.GRAGEN.TOOL_COHORT_VARIANTS
+    execution_environment:
+      type: warehouse
+      warehouse: GRAGEN_WH
+$$;
+
+-- ── Grants ────────────────────────────────────────────────────────────────────
+GRANT USAGE ON PROCEDURE GRAGEN_DB.GRAGEN.TOOL_COHORT_QUERY(VARCHAR)       TO ROLE SYSADMIN;
+GRANT USAGE ON PROCEDURE GRAGEN_DB.GRAGEN.TOOL_SAMPLE_META(VARCHAR)        TO ROLE SYSADMIN;
+GRANT USAGE ON PROCEDURE GRAGEN_DB.GRAGEN.TOOL_FIND_OUTLIERS(VARCHAR, INTEGER) TO ROLE SYSADMIN;
+GRANT USAGE ON PROCEDURE GRAGEN_DB.GRAGEN.TOOL_QUERY_ANNOTATIONS(VARCHAR, VARCHAR, INTEGER, INTEGER, VARCHAR, BOOLEAN) TO ROLE SYSADMIN;
+GRANT USAGE ON PROCEDURE GRAGEN_DB.GRAGEN.TOOL_PEDIGREE(VARCHAR) TO ROLE SYSADMIN;
+GRANT USAGE ON PROCEDURE GRAGEN_DB.GRAGEN.TOOL_COHORT_VARIANTS(VARCHAR, VARCHAR, INTEGER, INTEGER, VARCHAR, BOOLEAN) TO ROLE SYSADMIN;
+GRANT USAGE ON AGENT     GRAGEN_DB.GRAGEN.GENOMICS_AGENT                   TO ROLE SYSADMIN;
+
+-- Grant to the service identity role (replace GRAGEN_DB with your role name)
+GRANT USAGE ON AGENT     GRAGEN_DB.GRAGEN.GENOMICS_AGENT                   TO ROLE GRAGEN_DB;
+GRANT USAGE ON AGENT     GRAGEN_DB.GRAGEN.GENOMICS_AGENT                   TO ROLE GRAGEN_DB_ROLE;
+GRANT USAGE ON PROCEDURE GRAGEN_DB.GRAGEN.TOOL_COHORT_QUERY(VARCHAR)       TO ROLE GRAGEN_DB;
+GRANT USAGE ON PROCEDURE GRAGEN_DB.GRAGEN.TOOL_SAMPLE_META(VARCHAR)        TO ROLE GRAGEN_DB;
+GRANT USAGE ON PROCEDURE GRAGEN_DB.GRAGEN.TOOL_FIND_OUTLIERS(VARCHAR, INTEGER) TO ROLE GRAGEN_DB;
+GRANT USAGE ON PROCEDURE GRAGEN_DB.GRAGEN.TOOL_QUERY_ANNOTATIONS(VARCHAR, VARCHAR, INTEGER, INTEGER, VARCHAR, BOOLEAN) TO ROLE GRAGEN_DB;
+GRANT USAGE ON PROCEDURE GRAGEN_DB.GRAGEN.TOOL_PEDIGREE(VARCHAR) TO ROLE GRAGEN_DB;
+GRANT USAGE ON PROCEDURE GRAGEN_DB.GRAGEN.TOOL_COHORT_VARIANTS(VARCHAR, VARCHAR, INTEGER, INTEGER, VARCHAR, BOOLEAN) TO ROLE GRAGEN_DB;
+GRANT DATABASE ROLE SNOWFLAKE.CORTEX_USER TO ROLE GRAGEN_DB;
+
+-- Also grant the app DB role (used by the frontend service identity) so the
+-- agent and its tools are callable. CREATE OR REPLACE AGENT drops prior grants,
+-- so always re-run these after recreating the agent.
+GRANT USAGE ON PROCEDURE GRAGEN_DB.GRAGEN.TOOL_COHORT_QUERY(VARCHAR)       TO ROLE GRAGEN_DB_ROLE;
+GRANT USAGE ON PROCEDURE GRAGEN_DB.GRAGEN.TOOL_SAMPLE_META(VARCHAR)        TO ROLE GRAGEN_DB_ROLE;
+GRANT USAGE ON PROCEDURE GRAGEN_DB.GRAGEN.TOOL_FIND_OUTLIERS(VARCHAR, INTEGER) TO ROLE GRAGEN_DB_ROLE;
+GRANT USAGE ON PROCEDURE GRAGEN_DB.GRAGEN.TOOL_QUERY_ANNOTATIONS(VARCHAR, VARCHAR, INTEGER, INTEGER, VARCHAR, BOOLEAN) TO ROLE GRAGEN_DB_ROLE;
+GRANT USAGE ON PROCEDURE GRAGEN_DB.GRAGEN.TOOL_PEDIGREE(VARCHAR) TO ROLE GRAGEN_DB_ROLE;
+GRANT USAGE ON PROCEDURE GRAGEN_DB.GRAGEN.TOOL_COHORT_VARIANTS(VARCHAR, VARCHAR, INTEGER, INTEGER, VARCHAR, BOOLEAN) TO ROLE GRAGEN_DB_ROLE;
+
+SELECT 'External functions and Cortex Agent created successfully.' AS status;
+
+-- =============================================================================
+-- GRAGEN_SLICE + GRAGEN_CLINVAR_SLICE are created near the top of this file as
+-- SPCS service functions (bound to GRAGEN_SERVICE). The genome browser uses them.
+-- =============================================================================

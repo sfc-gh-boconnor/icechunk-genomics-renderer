@@ -1,0 +1,79 @@
+-- =============================================================================
+-- GRAGEN Genomics Accelerator — Deploy SPCS Services  (TEMPLATE / reference)
+-- =============================================================================
+-- CANONICAL deploy path is deploy.sh (it sources config.env and fills these in
+-- automatically). This template is a manual fallback. Render it with:
+--   set -a; source config.env; set +a
+--   envsubst '${S3_BUCKET} ${DEPLOY_PREFIX} ${AWS_REGION}' \
+--     < sql/03_deploy_services.sql.tmpl > sql/_rendered/03_deploy_services.sql
+-- then replace <REGISTRY>/<VERSION> and run it.
+--
+-- All storage is namespaced under your unique prefix:
+--   ICECHUNK_BUCKET          = ${S3_BUCKET}
+--   ICECHUNK_GENOMICS_PREFIX = ${DEPLOY_PREFIX}/genomics_repo
+-- =============================================================================
+
+USE ROLE SYSADMIN;
+USE SCHEMA GRAGEN_DB.GRAGEN;
+
+-- ── Backend: gragen-service (FastAPI, port 8080) ──────────────────────────────
+CREATE OR REPLACE SERVICE GRAGEN_DB.GRAGEN.GRAGEN_SERVICE
+  IN COMPUTE POOL GRAGEN_COMPUTE_POOL
+  FROM SPECIFICATION $$
+spec:
+  containers:
+  - name: gragen-service
+    image: /<REGISTRY>/gragen-service:<VERSION>
+    env:
+      PYTHONUNBUFFERED:           "1"
+      ICECHUNK_BUCKET:            "${S3_BUCKET}"
+      ICECHUNK_GENOMICS_PREFIX:   "${DEPLOY_PREFIX}/genomics_repo"
+      ICECHUNK_CLINVAR_PREFIX:    "${DEPLOY_PREFIX}/clinvar_repo"
+      AWS_DEFAULT_REGION:         "${AWS_REGION}"
+      INGEST_WORKERS:             "16"
+    secrets:
+    - snowflakeSecret:
+        objectName: GRAGEN_DB.GRAGEN.AWS_ACCESS_KEY_ID
+      envVarName: AWS_ACCESS_KEY_ID
+    - snowflakeSecret:
+        objectName: GRAGEN_DB.GRAGEN.AWS_SECRET_ACCESS_KEY
+      envVarName: AWS_SECRET_ACCESS_KEY
+    readinessProbe:
+      port: 8080
+      path: /health
+  endpoints:
+  - name: api-endpoint
+    port: 8080
+    public: false
+$$
+EXTERNAL_ACCESS_INTEGRATIONS = (ICECHUNK_S3_EAI, GENOMICS_1000G_EAI)
+MIN_INSTANCES = 1
+MAX_INSTANCES = 2;
+
+-- ── Frontend: gragen-accelerator (React + Express, port 3001) ─────────────────
+CREATE OR REPLACE SERVICE GRAGEN_DB.GRAGEN.GRAGEN_ACCELERATOR_SERVICE
+  IN COMPUTE POOL GRAGEN_COMPUTE_POOL
+  FROM SPECIFICATION $$
+spec:
+  containers:
+  - name: gragen-accelerator
+    image: /<REGISTRY>/gragen-accelerator:<VERSION>
+    env:
+      GRAGEN_SERVICE_URL:    "http://gragen-service:8080"
+      SNOWFLAKE_DATABASE:    "GRAGEN_DB"
+      SNOWFLAKE_SCHEMA:      "GRAGEN"
+      SNOWFLAKE_WAREHOUSE:   "GRAGEN_WH"
+    readinessProbe:
+      port: 3001
+      path: /healthz
+  endpoints:
+  - name: http-endpoint
+    port: 3001
+    public: true
+$$
+EXTERNAL_ACCESS_INTEGRATIONS = (GRAGEN_MAP_TILES_EAI)
+MIN_INSTANCES = 1
+MAX_INSTANCES = 1;
+
+-- ── Show app URL ──────────────────────────────────────────────────────────────
+SHOW ENDPOINTS IN SERVICE GRAGEN_DB.GRAGEN.GRAGEN_ACCELERATOR_SERVICE;
