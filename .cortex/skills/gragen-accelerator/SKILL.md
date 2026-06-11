@@ -1,28 +1,14 @@
 ---
 name: gragen-accelerator
-description: "Deploy the GRAGEN Genomics Accelerator on Snowflake Container Services (SPCS). Ingests 1000 Genomes DRAGEN VCF files from a public S3 bucket into an IceChunk Zarr store (same pattern as the weather/NetCDF project), then serves variant slice queries and cohort QC analytics via a FastAPI backend + React/DeckGL frontend. Includes a genome-wide annotation layer in Snowflake-managed Iceberg tables (ClinVar disease/gene, GWAS Catalog, SFARI autism genes) rendered as interactive markers on a 3D DNA helix, with chat-driven control. Use when: deploying GRAGEN accelerator, genomics IceChunk SPCS, 1000 Genomes DRAGEN visualisation, VCF to IceChunk pipeline, genomics annotations Iceberg, ClinVar GWAS SFARI, 3D DNA helix variant viewer, genomics Cortex Agent, variant browser Snowflake."
+description: "Deploy the GRAGEN Genomics Accelerator on Snowflake Container Services (SPCS). Ingests 1000 Genomes DRAGEN VCF files from a public S3 bucket into an IceChunk Zarr store, serves variant slice queries and cohort QC analytics via a FastAPI backend + React frontend. Includes a genome-wide annotation layer in Snowflake-managed Iceberg tables (ClinVar disease/gene, GWAS Catalog, SFARI autism genes) rendered as interactive markers on a 3D DNA helix with chat-driven control, cohort QC scatter, Origins globe, and Family Constellation trio viewer. Use when: deploying GRAGEN accelerator, genomics IceChunk SPCS, 1000 Genomes DRAGEN visualisation, VCF to IceChunk pipeline, genomics annotations Iceberg, ClinVar GWAS SFARI, 3D DNA helix variant viewer, genomics Cortex Agent, variant browser Snowflake, cohort QC, pedigree trio viewer."
 ---
 
 # GRAGEN Genomics Accelerator — SPCS Deployment
 
-End-to-end deployment of a genomics data app on Snowflake Container Services.
-**Same architecture as the IceChunk weather project** — VCF data replaces NetCDF data,
-genomic position replaces lat/lon, and allele frequency replaces weather variables.
-
-## IceChunk Pattern Mapping
-
-| IceChunk Weather | GRAGEN Genomics |
-|---|---|
-| NetCDF files on ASDI S3 | VCF.gz + TBI files on 1000genomes-dragen S3 |
-| `ingest_uk.py` | `ingest_genomics.py` |
-| `latitude[row,col]` / `longitude[row,col]` | `position[i]` (sorted 1D per chromosome) |
-| `air_temperature[row,col]` | `allele_freq[i]` (cohort allele frequency) |
-| `wind_speed[row,col]` | `het_rate[i]` (heterozygosity rate) |
-| Lat/lon bounding box | Chromosome + start_pos + end_pos |
-| `ICECHUNK_SLICE_UK(var, lat_min, lat_max, lon_min, lon_max)` | `GRAGEN_SLICE(chrom, start, end)` |
-| UK 2km / Global 10km datasets | chr1, chr2, … chr22, chrX |
-| Snapshot per forecast run | Snapshot per ingestion batch |
-| WEATHER_* saved tables | VARIANT_* saved tables |
+End-to-end deployment of a genomics data visualisation and analysis app on Snowflake Container Services.
+Stores 1000 Genomes cohort variant data in an **IceChunk Zarr store on S3**, with genome-wide
+annotations (ClinVar, GWAS, SFARI) in **Snowflake-managed Iceberg tables**, served by a
+FastAPI backend + React/Three.js frontend with a Cortex Agent chat interface.
 
 ## IceChunk Zarr Schema (per chromosome)
 
@@ -39,12 +25,12 @@ genomics_repo/           ← IceChunk store on S3 (<your-bucket>, <prefix>/genom
   …
 ```
 
-**Slice operation** (mirrors lat/lon mask):
+**Slice operation** (O(log n) range lookup via sorted position array):
 ```python
 # Find variants in chr22:20,000,000–25,000,000
 lo = np.searchsorted(position, 20_000_000)
 hi = np.searchsorted(position, 25_000_001)
-result = allele_freq[lo:hi]   # O(log n) range lookup
+result = allele_freq[lo:hi]
 ```
 
 ## Architecture
